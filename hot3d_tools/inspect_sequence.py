@@ -42,19 +42,25 @@ rgb = StreamId("214-1")
 print("rgb camera calib:", dev.get_camera_calibration(rgb)[1] if isinstance(dev.get_camera_calibration(rgb), tuple) else dev.get_camera_calibration(rgb))
 
 t = int(ts[len(ts) // 2])
-hp = p.headset_pose_data_provider.get_pose_at_timestamp(t, None, 0, None) if False else None
-for name in ["headset_pose_data_provider", "object_pose_data_provider", "hand_data_provider", "mano_hand_data_provider", "object_box2d_data_provider", "hand_box2d_data_provider", "object_library"]:
-    print(name, "->", type(getattr(p, name, None)).__name__)
+print("providers:", [a for a in dir(p) if a.endswith("provider")])
 
-# poses at one timestamp
-from data_loaders.loader_hand_poses import HandType  # noqa: F401
 from projectaria_tools.core.sensor_data import TimeDomain, TimeQueryOptions
-hdp = p.headset_pose_data_provider.get_pose_at_timestamp(
-    timestamp_ns=t, time_query_options=TimeQueryOptions.CLOSEST, time_domain=TimeDomain.TIME_CODE)
-print("headset pose @t:", hdp)
-odp = p.object_pose_data_provider.get_pose_at_timestamp(
-    timestamp_ns=t, time_query_options=TimeQueryOptions.CLOSEST, time_domain=TimeDomain.TIME_CODE)
-print("object poses @t:", {k: v.T_world_object.translation() for k, v in odp.pose3d_collection.poses.items()})
-hp = p.hand_data_provider.get_pose_at_timestamp(
-    timestamp_ns=t, time_query_options=TimeQueryOptions.CLOSEST, time_domain=TimeDomain.TIME_CODE)
-print("hand poses @t:", {str(k): v.wrist_pose.translation() for k, v in hp.pose3d_collection.poses.items()})
+q = dict(timestamp_ns=t, time_query_options=TimeQueryOptions.CLOSEST, time_domain=TimeDomain.TIME_CODE)
+dp = p.device_pose_data_provider.get_pose_at_timestamp(**q)
+print("device pose @t:", dp.pose3d.T_world_device)
+odp = p.object_pose_data_provider.get_pose_at_timestamp(**q)
+print("object poses @t:", {k: v.T_world_object.translation().round(3).tolist() for k, v in odp.pose3d_collection.poses.items()})
+hdp = getattr(p, "umetrack_hand_data_provider", None) or getattr(p, "mano_hand_data_provider", None)
+if hdp is not None:
+    hp = hdp.get_pose_at_timestamp(**q)
+    print("hand wrist @t:", {str(k): v.wrist_pose.translation().round(3).tolist() for k, v in hp.pose3d_collection.poses.items()})
+
+import pandas as pd
+m = {}
+for name in ["qa_pass", "hand_visible", "object_visible", "good_exposure", "hand_pose_available", "headset_pose_available"]:
+    df = pd.read_csv(f"{seq}/masks/mask_{name}.csv")
+    m[name] = round(df[df.stream_id == "214-1"]["mask"].mean(), 3)
+print("RGB-frame mask fractions:", m)
+bh = pd.read_csv(f"{seq}/box2d_hands.csv")
+bh = bh[bh.stream_id == "214-1"]
+print("hand vis ratio>0 by hand:", bh.assign(v=bh["visibility_ratio[%]"] > 0).groupby("hand_index").v.mean().round(3).to_dict())
