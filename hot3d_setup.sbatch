@@ -33,7 +33,7 @@ python -m pip check || true
 
 cd "$REPO/hot3d"
 python -c "
-import projectaria_tools, torch, vrs
+import projectaria_tools, torch, pyvrs  # pip package 'vrs' imports as pyvrs
 from dataset_api import Hot3dDataProvider
 print('torch', torch.__version__)
 print('HOT3D SETUP OK')
