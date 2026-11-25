@@ -26,8 +26,20 @@ def img_transform(cfg):
     return transform
 
 
+def episode_col(dataset):
+    """Name of the episode index column.
+
+    Lance datasets hide their index columns (episode_idx, step_idx) from
+    column_names, so check the raw schema / index columns too.
+    """
+    names = set(dataset.column_names)
+    names |= set(getattr(dataset, "_schema_names", []))
+    names |= set(getattr(dataset, "_index_columns", ()))
+    return "episode_idx" if "episode_idx" in names else "ep_idx"
+
+
 def get_episodes_length(dataset, episodes):
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+    col_name = episode_col(dataset)
 
     episode_idx = dataset.get_col_data(col_name)
     step_idx = dataset.get_col_data("step_idx")
@@ -65,7 +77,7 @@ def run(cfg: DictConfig):
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
     stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+    col_name = episode_col(dataset)
     ep_indices, _ = np.unique(stats_dataset.get_col_data(col_name), return_index=True)
 
     process = {}
@@ -110,7 +122,7 @@ def run(cfg: DictConfig):
     max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
     max_start_idx_dict = {ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)}
     # Map each dataset row’s episode_idx to its max_start_idx
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+    col_name = episode_col(dataset)
     max_start_per_row = np.array(
         [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
     )
@@ -130,8 +142,9 @@ def run(cfg: DictConfig):
 
     print(random_episode_indices)
 
-    eval_episodes = dataset.get_row_data(random_episode_indices)[col_name]
-    eval_start_idx = dataset.get_row_data(random_episode_indices)["step_idx"]
+    # read index columns directly: Lance get_row_data leaves them out
+    eval_episodes = np.asarray(dataset.get_col_data(col_name))[random_episode_indices]
+    eval_start_idx = np.asarray(dataset.get_col_data("step_idx"))[random_episode_indices]
 
     if len(eval_episodes) < cfg.eval.num_eval:
         raise ValueError("Not enough episodes with sufficient length for evaluation.")
