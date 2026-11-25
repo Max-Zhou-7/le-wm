@@ -26,7 +26,9 @@ case "$(which python)" in "$ENV"/*) ;; *) echo "wrong python: $(which python)"; 
 python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python -m pip install projectaria_tools==1.5.1 requests rerun-sdk==0.16.0 vrs matplotlib
 # optional hand deps (MANO hands need the MANO model files, licensed separately)
-python -m pip install 'git+https://github.com/vchoutas/smplx.git' 'git+https://github.com/mattloper/chumpy'
+# chumpy's setup.py imports pip, so it must build without isolation
+python -m pip install 'git+https://github.com/vchoutas/smplx.git'
+python -m pip install --no-build-isolation 'git+https://github.com/mattloper/chumpy'
 python -m pip check || true
 
 cd "$REPO/hot3d"
