@@ -28,3 +28,11 @@ assert not missing and not unexpected, "weights still do not match"
 out.parent.mkdir(parents=True, exist_ok=True)
 torch.save(model, out)
 print("SAVED", out, type(model).__name__)
+
+# eval.py loads models with swm.wm.utils.load_pretrained, which wants a folder
+# under $STABLEWM_HOME/checkpoints/ holding one .pt state dict + config.json.
+folder = home / "checkpoints" / "pusht_released"
+folder.mkdir(parents=True, exist_ok=True)
+torch.save(model.state_dict(), folder / "weights.pt")
+(folder / "config.json").write_text(json.dumps(cfg, indent=2))
+print("SAVED", folder, "-> use policy=pusht_released")
