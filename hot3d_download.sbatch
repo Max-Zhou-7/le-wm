@@ -28,8 +28,14 @@ if [ "$WHAT" = assets ]; then
     -o "$OUT/assets" -l assets -d assets
 else
   [ -n "$SEQS" ] || { echo "give sequence names"; exit 1; }
-  if [ "$TYPES" = all ]; then
-    TYPES="video_main_rgb mps_slam_trajectories mps_slam_calibration mps_slam_points mps_slam_summary mps_eye_gaze mps_artifacts main_vrs ground_truth hand_data"
+  # the downloader takes "all" or numeric indices, so map names -> indices
+  if [ "$TYPES" != all ]; then
+    TYPES=$(python -c "
+import sys
+from utils import load_data_groups_from_cdn
+g = [k for k in load_data_groups_from_cdn(sys.argv[1]) if k != 'mps_slam_summary']
+print(' '.join(str(g.index(t)) for t in sys.argv[2:]))
+" $LINKS/Hot3DAria_download_urls.json $TYPES)
   fi
   yes y | python dataset_downloader_base_main.py -c $LINKS/Hot3DAria_download_urls.json \
     -o "$OUT/aria" -l $SEQS -d $TYPES
