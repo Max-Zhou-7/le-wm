@@ -1,0 +1,38 @@
+#!/bin/bash
+#SBATCH -J hot3d-dl
+#SBATCH -p short
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=8G
+#SBATCH --time=04:00:00
+#SBATCH -o logs/%x_%j.log
+
+# Download HOT3D data with the official downloader, into scratch (re-creatable).
+# Usage:
+#   sbatch hot3d_download.sbatch assets
+#   sbatch hot3d_download.sbatch aria "<seq1> <seq2> ..." "<data types>"
+#   e.g. sbatch hot3d_download.sbatch aria P0003_c701bd11 "main_vrs ground_truth hand_data"
+# Link JSONs: ~/ondemand/dev/LeWM_forecasting/hot3d_links/ (expire 14 days after issue).
+WHAT=${1:?assets or aria}
+SEQS=${2:-}
+TYPES=${3:-all}
+source ~/.bashrc
+conda activate ~/envs/hot3d
+set -e
+LINKS=$HOME/ondemand/dev/LeWM_forecasting/hot3d_links
+OUT=/scratch/$USER/hot3d
+mkdir -p "$OUT"
+cd $HOME/ondemand/dev/LeWM_forecasting/hot3d/hot3d/data_downloader
+
+if [ "$WHAT" = assets ]; then
+  yes y | python dataset_downloader_base_main.py -c $LINKS/Hot3DAssets_download_urls.json \
+    -o "$OUT/assets" -l assets -d assets
+else
+  [ -n "$SEQS" ] || { echo "give sequence names"; exit 1; }
+  if [ "$TYPES" = all ]; then
+    TYPES="video_main_rgb mps_slam_trajectories mps_slam_calibration mps_slam_points mps_slam_summary mps_eye_gaze mps_artifacts main_vrs ground_truth hand_data"
+  fi
+  yes y | python dataset_downloader_base_main.py -c $LINKS/Hot3DAria_download_urls.json \
+    -o "$OUT/aria" -l $SEQS -d $TYPES
+fi
+echo "DOWNLOAD DONE"
+du -sh "$OUT"/*
