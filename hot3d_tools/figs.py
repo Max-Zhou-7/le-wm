@@ -143,9 +143,38 @@ def fig_actions(a):
     print("SAVED", a.out)
 
 
+def fig_wrists(a):
+    """Sanity check of probe targets: project the GT wrist (camera frame) with K into the stored frames."""
+    import json
+    D = load_split(a.lance_dir, "val", 110)
+    K = np.asarray(json.load(open(f"{a.lance_dir}/hot3d_fov110_meta.json"))["K"], np.float64)
+    from gap_eval import to_cam
+    rng = np.random.default_rng(1)
+    rows = np.sort(rng.choice(np.flatnonzero(D["hav"].all(1) & D["hv"]), 12, replace=False))
+    imgs = frames(D, rows)
+    fig, ax = plt.subplots(2, 6, figsize=(18, 6.5))
+    for i, (r, im) in enumerate(zip(rows, imgs)):
+        w = to_cam(D, np.array([r]), D["wrist_w"][[r]])[0] / 100.0     # [2,3] m
+        axx = ax.flat[i]
+        axx.imshow(im)                                                  # NOT rotated: K is for the stored frame
+        for k, c in enumerate(["cyan", "orange"]):
+            u = K[0, 0] * w[k, 0] / w[k, 2] + K[0, 2]
+            v = K[1, 1] * w[k, 1] / w[k, 2] + K[1, 2]
+            axx.plot(u, v, "o", ms=9, mfc="none", mec=c, mew=2)
+            axx.text(u + 4, v, f"{'LR'[k]} z={100 * w[k, 2]:.0f}cm", color=c, fontsize=7)
+        axx.set_title(f"{D['rec'][r]} row {r}", fontsize=7)
+        axx.axis("off")
+    fig.suptitle("GT wrist (cyan = left, orange = right) projected with K into the stored frame (NOT rotated). "
+                 "Circles should sit on the wrists.", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(a.out, dpi=100)
+    print("K", K.tolist())
+    print("SAVED", a.out)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["timewarp", "actions"])
+    ap.add_argument("cmd", choices=["timewarp", "actions", "wrists"])
     ap.add_argument("lance_dir")
     ap.add_argument("rest", nargs="+")
     ap.add_argument("--recording", default="")
@@ -153,6 +182,10 @@ if __name__ == "__main__":
     if a.cmd == "timewarp":
         a.fisheye_dir, a.out = a.rest
         fig_timewarp(a)
+    elif a.cmd == "wrists":
+        (a.out,) = a.rest
+        fig_wrists(a)
     else:
         (a.out,) = a.rest
         fig_actions(a)
+
