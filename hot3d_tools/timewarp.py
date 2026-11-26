@@ -80,7 +80,7 @@ class Warper:
         self.out_size, self.render = out_size, render
         self.rays = pinhole_rays(fov, render)
 
-    def __call__(self, fish_img, params_full, full_size, R_src_dst=None, valid_radius=None, max_angle=None):
+    def __call__(self, fish_img, params_full, full_size, R_src_dst=None, valid_radius=None, max_angle=None, fill=None):
         """fish_img: fisheye image at time t (size x size, downsampled from full_size).
         R_src_dst: rotation taking directions in the target camera (t+g) into the source
         camera (t), i.e. R_c(t)<-c(t+g) = R_wc(t)^T R_wc(t+g). None = identity."""
@@ -102,10 +102,20 @@ class Warper:
         s = fish_img.shape[0] / full_size
         uv = (uv + 0.5) * s - 0.5                  # same as CameraCalibration.rescale (half-pixel rule)
         out = bilinear(fish_img, uv) * ok[..., None]
-        out = np.clip(out + 0.5, 0, 255).astype(np.uint8)
-        if self.render != self.out_size:
-            out = np.asarray(Image.fromarray(out).resize((self.out_size, self.out_size), Image.BOX))
-        return out
+        if fill is None:
+            out = np.clip(out + 0.5, 0, 255).astype(np.uint8)
+            if self.render != self.out_size:
+                out = np.asarray(Image.fromarray(out).resize((self.out_size, self.out_size), Image.BOX))
+            return out
+        # "fill" variant: pixels the old fisheye never saw (cov = 0) take the unwarped last frame
+        # (fill = stored pinhole frame at t, out_size x out_size). Box-average at render res, then
+        # out = warped + (1 - coverage) * fill, so partly covered output pixels blend.
+        k = self.render // self.out_size
+        assert k * self.out_size == self.render
+        box = lambda x: x.reshape(self.out_size, k, self.out_size, k, -1).mean((1, 3))
+        w, cov = box(out), box(ok[..., None].astype(np.float32))
+        out = w + (1 - cov) * np.asarray(fill, np.float32)
+        return np.clip(out + 0.5, 0, 255).astype(np.uint8)
 
 
 def selftest(path):

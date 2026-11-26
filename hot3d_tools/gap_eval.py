@@ -10,7 +10,10 @@ Methods (embedding methods are scored through the frozen probes from probes.py):
   B0  repeat      z_hat = z_r
   B1  linear      z_hat = z_r + g (z_r - z_{r-3})
   B2  timewarp    warp the ORIGINAL fisheye at r into the pinhole view of r+3g using the
-                  true head rotation (head pose is known during the gap: SLAM/IMU), encode
+                  true head rotation (head pose is known during the gap: SLAM/IMU), encode.
+                  Directions the old fisheye never saw stay black (the sensor image ends at ~57 deg
+                  off-axis, the pinhole needs 55 deg at the sides and 63.7 at the corners).
+      timewarp_fill  same, but uncovered pixels take the unwarped last frame
   B3  kalman_gt   constant-velocity Kalman per wrist on the GT wrist track (world frame),
                   predicted position put into camera(r+3g) with the true head pose
       kalman_probe  same, observations = probe(z) of the history frames
@@ -242,8 +245,11 @@ def main():
         W = Warper(fov=a.fov)
         from torchvision.io import decode_jpeg
         cache = {}
-        zs = {g: np.zeros((len(R), Z.shape[1]), np.float32) for g in GAPS}
-        pix = {g: [] for g in GAPS}
+        VARS = ["B2_timewarp", "B2_timewarp_fill"]   # black where uncovered / unwarped last frame there
+        zs = {(v, g): np.zeros((len(R), Z.shape[1]), np.float32) for v in VARS for g in GAPS}
+        pix = {(v, g): [] for v in VARS for g in GAPS}
+        unc = {g: [] for g in GAPS}
+        dec = lambda b: decode_jpeg(torch.frombuffer(bytearray(b), dtype=torch.uint8)).permute(1, 2, 0).numpy()
         for i, r in enumerate(R):
             rec = D["rec"][r]
             if rec not in cache:
@@ -253,31 +259,41 @@ def main():
             s = int(D["step"][r])
             assert abs(f.ts[s] / 1e9 - f.ts[0] / 1e9 - D["t"][r]) < 1e-3, "fisheye/lance timestamps differ"
             img = f.image(s)
-            outs = []
+            last = dec(D["ds"].take([int(r)], columns=["pixels"])["pixels"].to_pylist()[0])
+            args = (f.d["proj_params"][s], int(f.d["full_size"]))
+            kw = dict(valid_radius=f.d["valid_radius"][s], max_angle=float(f.d["max_solid_angle"][s]))
+            outs = {v: [] for v in VARS}
             for g in GAPS:
-                tg = r + FS * g
-                Rsd = D["Rwc"][r].T @ D["Rwc"][tg]
-                outs.append(W(img, f.d["proj_params"][s], int(f.d["full_size"]), Rsd, f.d["valid_radius"][s],
-                                 float(f.d["max_solid_angle"][s])))
+                Rsd = D["Rwc"][r].T @ D["Rwc"][r + FS * g]
+                o = W(img, *args, Rsd, **kw)
+                outs["B2_timewarp"].append(o)
+                outs["B2_timewarp_fill"].append(W(img, *args, Rsd, fill=last, **kw))
+                # uncovered share of the target view's lit area
+                tv = last.sum(-1) > 0
+                unc[g].append(float(((o.sum(-1) == 0) & tv).sum() / max(tv.sum(), 1)))
             if i % 20 == 0:  # pixel error on a subset (decode the stored target frames)
                 blobs = D["ds"].take([int(r + FS * g) for g in GAPS], columns=["pixels"])["pixels"].to_pylist()
-                for g, o, b in zip(GAPS, outs, blobs):
-                    ref = decode_jpeg(torch.frombuffer(bytearray(b), dtype=torch.uint8)).permute(1, 2, 0).numpy()
-                    pix[g].append(np.abs(o.astype(np.float32) - ref).mean() / 255)
-            x = torch.from_numpy(np.stack(outs)).permute(0, 3, 1, 2)
+                refs = [dec(b).astype(np.float32) for b in blobs]
+                for v in VARS:
+                    for g, o, ref in zip(GAPS, outs[v], refs):
+                        pix[(v, g)].append(np.abs(o.astype(np.float32) - ref).mean() / 255)
+            x = torch.from_numpy(np.stack(outs[VARS[0]] + outs[VARS[1]])).permute(0, 3, 1, 2)
             x = ((x.float() / 255 - MEAN) / STD).to(dev)
             with torch.no_grad(), torch.autocast(dev, dtype=torch.bfloat16, enabled=dev == "cuda"):
                 e = model.encode({"pixels": x[:, None]})["emb"][:, 0].float().cpu().numpy()
-            for j, g in enumerate(GAPS):
-                zs[g][i] = e[j]
+            for vi, v in enumerate(VARS):
+                for j, g in enumerate(GAPS):
+                    zs[(v, g)][i] = e[vi * len(GAPS) + j]
             if i % 500 == 0:
                 print(f"timewarp {i}/{len(R)} ({time.time() - t0:.0f}s)", flush=True)
-        for g in GAPS:
-            tgt = R + FS * g
-            res = score_pose(D, probes, tgt, z_hat=zs[g])
-            res["emb_err"] = float(np.linalg.norm(zs[g] - Z[tgt], axis=1).mean() / zscale)
-            res["pix_mae"] = float(np.mean(pix[g]))
-            put("B2_timewarp", g, res)
+        for v in VARS:
+            for g in GAPS:
+                tgt = R + FS * g
+                res = score_pose(D, probes, tgt, z_hat=zs[(v, g)])
+                res["emb_err"] = float(np.linalg.norm(zs[(v, g)] - Z[tgt], axis=1).mean() / zscale)
+                res["pix_mae"] = float(np.mean(pix[(v, g)]))
+                res["uncovered_frac"] = float(np.mean(unc[g]))
+                put(v, g, res)
         # repeat-last pixel error for reference
         for g in GAPS:
             idx = R[::20]
