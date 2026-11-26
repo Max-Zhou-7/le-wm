@@ -57,7 +57,8 @@ for split, names in meta["splits"].items():
         if len(rows) != meta["frames"][n] or not (rec[rows] == n).all() or not (np.diff(rows) == 1).all():
             fail(f"{split}/{n}: episode {e} rows/recording mismatch")
             continue
-        d = np.load(f"{a.npz_dir}/{n}.npz")
+        z = np.load(f"{a.npz_dir}/{n}.npz")
+        d = {k: z[k] for k in z.files}  # read each array once (npz re-decompresses on every access)
         T = meta["frames"][n]
         idx = np.sort(rng.choice(T, min(a.per_rec, T), replace=False))
         tab = ds.take(rows[idx].tolist(), columns=["step_idx", "pixels", "t_sec", "head_valid", "hand_joints_valid"] + NUM).to_pydict()
