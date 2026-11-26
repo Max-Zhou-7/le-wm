@@ -18,7 +18,7 @@ python -c "import torch; assert torch.cuda.is_available(), 'NO GPU'; print('torc
 
 CMD="python train.py data=${DATA:-pusht} wandb.enabled=false ${*:2}"
 if [ "$MODE" = "smoke" ]; then
-    timeout 15m $CMD; rc=$?
+    timeout ${SMOKE_MIN:-15}m $CMD; rc=$?
     [ $rc -eq 124 ] && { echo "SMOKE OK"; exit 0; }
     exit $rc
 else

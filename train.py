@@ -90,7 +90,9 @@ def run(cfg):
     )
 
     train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
-    val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
+    # workers start one at a time (~35 s each, spawn + heavy imports): keep the val loader small
+    val_loader_cfg = {**cfg.loader, "num_workers": cfg.get("val_num_workers", cfg.loader.num_workers)}
+    val = torch.utils.data.DataLoader(val_set, **val_loader_cfg, shuffle=False, drop_last=False)
     
     ##############################
     ##       model / optim      ##
