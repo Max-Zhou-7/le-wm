@@ -27,9 +27,9 @@ RGB_ID = "214-1"
 
 
 def _resize_offset(full, size):
-    # pixel centres at integer coords: u_new = (u_old + 0.5) * s - 0.5 = (u_old - off) * s
-    s = size / full
-    return s, 0.5 / s - 0.5
+    # rescale() requires new_res == (old_res - 2*offset) * scale, so no half-pixel centre fix:
+    # leaves a ~0.44 px shift at 512 (~0.19 px at 224). The --check step measures the total error.
+    return size / full, 0.0
 
 
 class FisheyeRecording:
