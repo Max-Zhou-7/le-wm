@@ -128,7 +128,7 @@ def kalman_cv(obs, ok, q, r, g):
         x = None
         for h in range(H):
             if x is not None:
-                x = x @ F.T
+                x = F @ x
                 P = F @ P @ F.T + Q
             if ok[i, h]:
                 if x is None:
