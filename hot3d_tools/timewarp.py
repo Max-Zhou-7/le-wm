@@ -80,14 +80,22 @@ class Warper:
         self.out_size, self.render = out_size, render
         self.rays = pinhole_rays(fov, render)
 
-    def __call__(self, fish_img, params_full, full_size, R_src_dst=None):
+    def __call__(self, fish_img, params_full, full_size, R_src_dst=None, valid_radius=None):
         """fish_img: fisheye image at time t (size x size, downsampled from full_size).
         R_src_dst: rotation taking directions in the target camera (t+g) into the source
         camera (t), i.e. R_c(t)<-c(t+g) = R_wc(t)^T R_wc(t+g). None = identity."""
+        prm = np.asarray(params_full, np.float64)
         d = self.rays if R_src_dst is None else self.rays @ np.asarray(R_src_dst).T
-        uv, ok = fisheye624_project(d, np.asarray(params_full, np.float64))
-        s = fish_img.shape[0] / full_size          # same as CameraCalibration.rescale(scale=s, offset=0)
-        uv = uv * s
+        uv, ok = fisheye624_project(d, prm)
+        # projectaria blacks out pixels outside the lens' valid radius (the stored frames' black
+        # corners, ~12%). Same here: the target view keeps its fixed corners (identity rays), and
+        # source rays outside the valid radius are black too.
+        if valid_radius is not None and np.isfinite(valid_radius):
+            inr = lambda q: ((q[..., 0] - prm[1]) ** 2 + (q[..., 1] - prm[2]) ** 2) <= valid_radius ** 2
+            uv0 = uv if R_src_dst is None else fisheye624_project(self.rays, prm)[0]
+            ok = ok & inr(uv) & inr(uv0)
+        s = fish_img.shape[0] / full_size
+        uv = (uv + 0.5) * s - 0.5                  # same as CameraCalibration.rescale (half-pixel rule)
         out = bilinear(fish_img, uv) * ok[..., None]
         out = np.clip(out + 0.5, 0, 255).astype(np.uint8)
         if self.render != self.out_size:
@@ -140,7 +148,7 @@ def identity(a):
     for i in np.linspace(0, len(f) - 1, 5).astype(int):
         blob = ds.take([int(rows[i])], columns=["pixels"])["pixels"].to_pylist()[0]
         ref = decode_jpeg(torch.frombuffer(bytearray(blob), dtype=torch.uint8)).permute(1, 2, 0).numpy()
-        out = W(f.image(i), f.d["proj_params"][i], int(f.d["full_size"]))
+        out = W(f.image(i), f.d["proj_params"][i], int(f.d["full_size"]), valid_radius=f.d["valid_radius"][i])
         errs.append(np.abs(out.astype(np.float32) - ref).mean())
     print(f"identity warp vs stored Lance frames: mean abs err {np.round(errs, 2).tolist()} /255")
 

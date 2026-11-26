@@ -257,7 +257,7 @@ def main():
             for g in GAPS:
                 tg = r + FS * g
                 Rsd = D["Rwc"][r].T @ D["Rwc"][tg]
-                outs.append(W(img, f.d["proj_params"][s], int(f.d["full_size"]), Rsd))
+                outs.append(W(img, f.d["proj_params"][s], int(f.d["full_size"]), Rsd, f.d["valid_radius"][s]))
             if i % 20 == 0:  # pixel error on a subset (decode the stored target frames)
                 blobs = D["ds"].take([int(r + FS * g) for g in GAPS], columns=["pixels"])["pixels"].to_pylist()
                 for g, o, b in zip(GAPS, outs, blobs):
