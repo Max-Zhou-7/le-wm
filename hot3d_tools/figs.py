@@ -66,12 +66,17 @@ def fig_timewarp(a):
             real_t, real_k = frames(D, [r, tg])
             diff = np.abs(pred.astype(np.float32) - real_k).mean(-1)
             diff0 = np.abs(real_t.astype(np.float32) - real_k).mean(-1)
+            # score only pixels the warp covers (black = the old frame never saw that direction)
+            cov = (pred.sum(-1) > 0) & (real_k.sum(-1) > 0)
+            unc = 1 - cov.sum() / max((real_k.sum(-1) > 0).sum(), 1)
+            diff_title = (f"|TW - real| {diff[cov].mean():.1f}/255 (repeat-last {diff0[cov].mean():.1f})\n"
+                          f"on covered px; {100 * unc:.0f}% not covered")
             row = c * len(KS) + j
             for col, (im, title) in enumerate([
                     (real_t, f"{rec} real t" if j == 0 else "real t"),
                     (pred, f"TimeWarp t+{k} ({100 * k} ms, head turn {ang:.1f} deg)"),
                     (real_k, f"real t+{k}"),
-                    (diff, f"|TW - real| {diff.mean():.1f}/255 (repeat-last {diff0.mean():.1f})")]):
+                    (diff, diff_title)]):
                 axx = ax[row, col]
                 if im.ndim == 2:
                     axx.imshow(show(im), cmap="magma", vmin=0, vmax=80)
