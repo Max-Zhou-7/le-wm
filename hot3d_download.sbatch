@@ -41,4 +41,4 @@ print(' '.join(str(g.index(t)) for t in sys.argv[2:]))
     -o "$OUT/aria" -l $SEQS -d $TYPES
 fi
 echo "DOWNLOAD DONE"
-du -sh "$OUT"/*
+du -sh "$OUT"/* 2>/dev/null || true   # other array tasks may delete tmp files mid-scan
