@@ -148,20 +148,20 @@ def example(a):
         txt += lines
         # images: real t+k, nearest to LeWM forecast, nearest to repeat-last
         nl, dl = nearest(zf[k - 1])
-        nr, dr = nearest(zrep)
-        nimg = frames(D, [nl, nr])
+        nimg = frames(D, [nl])
+        drep = np.linalg.norm(zrep - Z[tg])
         dtrue = np.linalg.norm(zf[k - 1] - Z[tg])
         lab = lambda i: (f"same rec, {D['t'][i] - D['t'][tg]:+.2f} s from t+{k}" if D["rec"][i] == rec
                          else f"other rec {D['rec'][i]}")
         for row, (im, title) in enumerate([
                 (imgs[1 + c], f"real t+{k} ({100 * k} ms)"),
                 (nimg[0], f"nearest val frame to LeWM forecast\n{lab(nl)}\nd={dl:.2f} (d to true z: {dtrue:.2f})"),
-                (nimg[1], f"nearest val frame to repeat-last\n{lab(nr)}  d={dr:.2f}")]):
+                (imgs[0], f"repeat-last = frame t\n(d to true z_t+{k}: {drep:.2f})")]):
             ax = fig.add_subplot(gs[row, 1 + c])
             ax.imshow(show(im)); ax.set_title(title, fontsize=7); ax.axis("off")
     axt = fig.add_subplot(gs[1:3, 0]); axt.axis("off")
     axt.text(0, 1, "columns: k = 1, 4, 8\nrow 1: real frame\nrow 2: nearest val frame\n  to LeWM forecast\n"
-             "row 3: nearest val frame\n  to repeat-last (z_t)\n\nFrames rotated 90 deg cw\nfor display.",
+             "row 3: repeat-last (frame t;\n  its nearest frame is itself)\n\nFrames rotated 90 deg cw\nfor display.",
              fontsize=8, va="top", family="monospace")
     axw = fig.add_subplot(gs[3, 1:]); axw.axis("off")
     wl = txt[txt.index("Wrist positions in camera(target) frame, cm  [x, y, z]   (error = |pred - true|)"):]
