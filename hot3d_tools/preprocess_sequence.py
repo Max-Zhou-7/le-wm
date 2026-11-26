@@ -130,6 +130,13 @@ def main():
 
     if hand_joints is None:
         hand_joints = np.full((T, 2, 22), np.nan, np.float32)
+    # CLOSEST lookup can reach across gaps in the GT (pilot: hand poses 100 ms away).
+    # Poses more than MAX_DT_NS from the frame are treated as missing; *_dt_ns keeps the raw gap.
+    MAX_DT_NS = 5_000_000
+    T_world_device[np.abs(head_dt) > MAX_DT_NS] = np.nan
+    far = np.abs(hand_dt) > MAX_DT_NS
+    hand_wrist[far], hand_joints[far] = np.nan, np.nan
+    obj_pose[np.abs(obj_dt) > MAX_DT_NS] = np.nan
     vis = {}
     for r in csv.DictReader(open(f"{a.seq}/box2d_hands.csv")) if os.path.exists(f"{a.seq}/box2d_hands.csv") else []:
         if r["stream_id"] == "214-1":
