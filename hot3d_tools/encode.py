@@ -13,10 +13,13 @@ Usage (lewm env; GPU or CPU):
 import argparse
 import json
 import os
+import sys
 import time
 
 import numpy as np
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # jepa.py, module.py
 
 MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
