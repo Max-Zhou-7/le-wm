@@ -16,6 +16,18 @@ echo "Mode: $MODE  Node: $(hostname)"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 python -c "import torch; assert torch.cuda.is_available(), 'NO GPU'; print('torch', torch.__version__, 'GPU OK:', torch.cuda.get_device_name(0))" || exit 1
 
+# LOCAL_COPY=<table.lance>: copy that dataset to node-local /tmp first (avoids re-reading it from
+# scratch over the network when page cache is short; two HOT3D runs on one node fell to <1 it/s).
+if [ -n "$LOCAL_COPY" ]; then
+    LD=/tmp/lewm_$SLURM_JOB_ID
+    mkdir -p $LD/datasets
+    trap "rm -rf $LD" EXIT
+    t0=$(date +%s)
+    cp -r "$STABLEWM_HOME/datasets/$LOCAL_COPY" $LD/datasets/
+    echo "local copy of $LOCAL_COPY: $(du -sh $LD/datasets | cut -f1) in $(( $(date +%s) - t0 )) s"
+    export LOCAL_DATASET_DIR=$LD
+fi
+
 CMD="python train.py data=${DATA:-pusht} wandb.enabled=false ${*:2}"
 if [ "$MODE" = "smoke" ]; then
     timeout ${SMOKE_MIN:-15}m $CMD; rc=$?
