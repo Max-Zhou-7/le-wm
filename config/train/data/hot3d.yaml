@@ -1,0 +1,13 @@
+# HOT3D Aria RGB (pinhole 110 deg, 224 px), 30 fps stored, trained at 10 fps (frameskip 3).
+dataset:
+  num_steps: ${eval:'${num_preds} + ${history_size}'}
+  frameskip: 3
+  name: hot3d_train_fov110.lance
+  keys_to_load:
+    - pixels
+    - action
+  keys_to_cache:
+    - action
+hot3d:
+  action_variant: head_hands   # none | head | head_hands
+  max_dt: 0.05                 # skip clips with a raw time step > 50 ms

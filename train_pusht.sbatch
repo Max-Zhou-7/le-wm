@@ -16,7 +16,7 @@ echo "Mode: $MODE  Node: $(hostname)"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 python -c "import torch; assert torch.cuda.is_available(), 'NO GPU'; print('torch', torch.__version__, 'GPU OK:', torch.cuda.get_device_name(0))" || exit 1
 
-CMD="python train.py data=pusht wandb.enabled=false ${*:2}"
+CMD="python train.py data=${DATA:-pusht} wandb.enabled=false ${*:2}"
 if [ "$MODE" = "smoke" ]; then
     timeout 15m $CMD; rc=$?
     [ $rc -eq 124 ] && { echo "SMOKE OK"; exit 0; }

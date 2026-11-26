@@ -11,7 +11,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from module import SIGReg
-from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
+from utils import get_column_normalizer, get_hot3d_action_transform, get_img_preprocessor, SaveCkptCallback
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -58,9 +58,14 @@ def run(cfg):
     )
     transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
     
+    hot3d = cfg.data.get("hot3d")
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
+                continue
+            if hot3d and col == "action":
+                # valid-rows-only normalizer + action variant (none / head / head_hands)
+                transforms.append(get_hot3d_action_transform(dataset, hot3d.action_variant))
                 continue
             normalizer = get_column_normalizer(dataset, col, col)
             transforms.append(normalizer)
@@ -70,9 +75,18 @@ def run(cfg):
     transform = spt.data.transforms.Compose(*transforms)
     dataset.transform = transform
 
+    split_source = dataset
+    if hot3d:
+        # RULE: skip clips whose raw frames contain a time step > 50 ms
+        from hot3d_tools.windows import swm_valid_indices
+        keep = swm_valid_indices(dataset, dataset.get_col_data("t_sec"), max_dt=hot3d.max_dt)
+        print(f"hot3d: {len(keep)}/{len(dataset)} clips pass the {hot3d.max_dt * 1000:.0f} ms rule; "
+              f"action variant {hot3d.action_variant}", flush=True)
+        split_source = torch.utils.data.Subset(dataset, keep)
+
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     train_set, val_set = spt.data.random_split(
-        dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
+        split_source, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
     )
 
     train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)

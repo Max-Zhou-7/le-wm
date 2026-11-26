@@ -31,6 +31,44 @@ def get_column_normalizer(dataset, source: str, target: str):
     std = data.std(0, keepdim=True).clone()
     return dt.transforms.WrapTorchTransform(ZScoreNormalizer(mean, std), source=source, target=target)
 
+class Hot3dActionTransform:
+    """HOT3D action (T, frameskip*15): per raw step [head t(3), head r(3), L(3), R(3), flags(3)].
+    Z-scores dims 0:12 with stats from VALID rows only, leaves the flags as 0/1, puts invalid
+    parts back to exactly 0, then applies the variant:
+      none        all zeros (the predictor gets no motion input)
+      head        head part + head flag only
+      head_hands  everything"""
+
+    def __init__(self, mean, std, variant):
+        assert variant in ("none", "head", "head_hands"), variant
+        self.mean, self.std, self.variant = mean, std, variant
+
+    def __call__(self, x):
+        T = x.shape[0]
+        a = torch.nan_to_num(x.float(), 0.0).reshape(T, -1, 15).clone()
+        flags = a[..., 12:15]
+        a[..., :12] = (a[..., :12] - self.mean) / self.std
+        a[..., 0:6] *= flags[..., 0:1]
+        a[..., 6:9] *= flags[..., 1:2]
+        a[..., 9:12] *= flags[..., 2:3]
+        if self.variant == "none":
+            a.zero_()
+        elif self.variant == "head":
+            a[..., 6:12] = 0
+            a[..., 13:15] = 0
+        return a.reshape(T, -1)
+
+
+def get_hot3d_action_transform(dataset, variant):
+    act = torch.from_numpy(np.asarray(dataset.get_col_data("action"), dtype=np.float32))
+    mean, std = torch.zeros(12), torch.ones(12)
+    for part, (lo, hi) in enumerate([(0, 6), (6, 9), (9, 12)]):
+        v = act[act[:, 12 + part] > 0.5, lo:hi]
+        mean[lo:hi], std[lo:hi] = v.mean(0), v.std(0).clamp_min(1e-6)
+    return dt.transforms.WrapTorchTransform(Hot3dActionTransform(mean, std, variant),
+                                            source="action", target="action")
+
+
 class SaveCkptCallback(Callback):
     """Callback to save model checkpoint after each epoch using save_pretrained."""
 
