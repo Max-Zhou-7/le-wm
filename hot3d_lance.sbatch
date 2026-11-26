@@ -3,6 +3,8 @@
 #SBATCH -p short
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
+#SBATCH --constraint=ib
+# (ib = cascadelake/skylake nodes; lance crashes with "Illegal instruction" on old c3xxx CPUs)
 #SBATCH --time=06:00:00
 #SBATCH -o logs/%x_%j.log
 
