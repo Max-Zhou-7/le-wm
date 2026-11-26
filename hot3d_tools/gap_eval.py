@@ -19,7 +19,7 @@ Methods (embedding methods are scored through the frozen probes from probes.py):
       kalman_probe  same, observations = probe(z) of the history frames
       hold_gt     last GT wrist position (world), no motion
   oracle          probe(z_{r+3g}) = the probe's own error on the real frame
-  (M LeWM rollout: added after HOT3D training.)
+  M_lewm_<variant>  LeWM rollout (lewm_forecast.py; --lewm <policy> --variant <v>)
 
 Scores per method and gap (only where the target is valid at r+3g; 0 poses never used):
   wrist_cm (left+right pooled, mean / median / frac < 5 cm), obj_cm, up_deg,
@@ -48,11 +48,11 @@ HIST = 9  # history steps before r (10 obs incl. r)
 FS = 3    # frameskip (10 fps)
 
 
-def load_split(lance_dir, split, fov):
+def load_split(lance_dir, split, fov, extra=()):
     import lance
     ds = lance.dataset(f"{lance_dir}/hot3d_{split}_fov{fov}.lance")
     cols = ["episode_idx", "step_idx", "t_sec", "recording", "T_world_device", "T_device_camera", "head_valid",
-            "hand_wrist", "hand_valid", "obj_pose", "obj_valid"]
+            "hand_wrist", "hand_valid", "obj_pose", "obj_valid"] + list(extra)
     tab = ds.to_table(columns=cols)
     g = lambda c: np.asarray(tab[c].to_pylist(), np.float64)
     N = tab.num_rows
@@ -72,6 +72,8 @@ def load_split(lance_dir, split, fov):
         obj_w=g("obj_pose").reshape(N, -1, 7)[..., :3],
         ov=g("obj_valid").reshape(N, -1) > 0.5,
     )
+    for c in extra:
+        D[c] = np.asarray(tab[c].to_pylist(), np.float32).reshape(N, -1)
     return D
 
 
@@ -187,9 +189,11 @@ def main():
     ap.add_argument("--r", type=float, nargs="+", default=[0.1, 1.0, 10.0, 100.0, 1000.0])
     ap.add_argument("--no-timewarp", action="store_true")
     ap.add_argument("--max-windows", type=int, default=0)
+    ap.add_argument("--lewm", default=None, help="LeWM policy for method M (same checkpoint as emb_dir)")
+    ap.add_argument("--variant", default="head_hands", help="action variant the LeWM policy was trained with")
     a = ap.parse_args()
     t0 = time.time()
-    D = load_split(a.lance_dir, a.split, a.fov)
+    D = load_split(a.lance_dir, a.split, a.fov, extra=["action"] if a.lewm else [])
     Z = np.load(f"{a.emb_dir}/emb_{a.split}.npy").astype(np.float32)
     rows = np.load(f"{a.emb_dir}/rows_{a.split}.npy")
     assert len(rows) == D["N"] and (rows == np.arange(D["N"])).all(), "need stride-1 embeddings"
@@ -234,6 +238,18 @@ def main():
             res = dict(grid[best], q=best[0], r=best[1])
             put(tag, g, res)
         print(f"g={g} done ({time.time() - t0:.0f}s)", flush=True)
+
+    if a.lewm:
+        from lewm_forecast import Forecaster, raw_actions
+        Fc = Forecaster(a.lewm, a.variant, a.lance_dir)
+        K = max(GAPS)
+        zf = Fc.rollout(np.stack([Z[R - 2 * FS], Z[R - FS], Z[R]], 1), raw_actions(D, R, K), K)
+        for g in GAPS:
+            tgt = R + FS * g
+            res = score_pose(D, probes, tgt, z_hat=zf[:, g - 1])
+            res["emb_err"] = float(np.linalg.norm(zf[:, g - 1] - Z[tgt], axis=1).mean() / zscale)
+            put(f"M_lewm_{a.variant}", g, res)
+        print(f"LeWM rollout done ({time.time() - t0:.0f}s)", flush=True)
 
     if not a.no_timewarp:
         import torch
