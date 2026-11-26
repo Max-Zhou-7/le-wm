@@ -67,6 +67,8 @@ def episode(path):
         meta["hand_joints_dim"] = int(d["hand_joints"].shape[-1])
     else:
         assert np.allclose(meta["K"], d["K"]) and meta["obj_uids"] == d["obj_uids"].tolist()
+    # LanceWriter expects a list of per-frame values for each column
+    ep = {k: list(v) for k, v in ep.items()}
     return ep, T
 
 
