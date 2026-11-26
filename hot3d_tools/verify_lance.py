@@ -29,6 +29,9 @@ rng = np.random.default_rng(0)
 NUM = ["T_world_device", "T_device_camera", "hand_wrist", "hand_joints", "hand_valid",
        "hand_vis_ratio", "obj_pose", "obj_valid", "qa_pass", "mask_hand_visible",
        "mask_object_visible", "mask_good_exposure"]
+# Lance stores NaN as 0 (-1 for hand_vis_ratio) plus validity flags
+VALID = {"T_world_device": "head_valid", "hand_wrist": "hand_valid",
+         "hand_joints": "hand_joints_valid", "obj_pose": "obj_valid"}
 ok = True
 
 
@@ -57,7 +60,7 @@ for split, names in meta["splits"].items():
         d = np.load(f"{a.npz_dir}/{n}.npz")
         T = meta["frames"][n]
         idx = np.sort(rng.choice(T, min(a.per_rec, T), replace=False))
-        tab = ds.take(rows[idx].tolist(), columns=["step_idx", "pixels", "t_sec"] + NUM).to_pydict()
+        tab = ds.take(rows[idx].tolist(), columns=["step_idx", "pixels", "t_sec", "head_valid", "hand_joints_valid"] + NUM).to_pydict()
         if list(tab["step_idx"]) != idx.tolist():
             fail(f"{split}/{n}: step_idx mismatch")
         ts = d["timestamps_ns"]
@@ -65,9 +68,16 @@ for split, names in meta["splits"].items():
             fail(f"{split}/{n}: t_sec mismatch")
         for c in NUM:
             got = np.asarray(tab[c], np.float32)
-            ref = np.asarray(d[c], np.float32).reshape(T, -1)[idx]
-            if got.shape != ref.shape or not np.allclose(got, ref, equal_nan=True, atol=1e-6):
+            raw = np.asarray(d[c], np.float32)[idx]
+            ref = np.nan_to_num(raw.reshape(len(idx), -1), nan=-1.0 if c == "hand_vis_ratio" else 0.0)
+            if got.shape != ref.shape or not np.allclose(got, ref, atol=1e-6):
                 fail(f"{split}/{n}: column {c} differs")
+            if c in VALID:
+                want_v = ~np.isnan(raw).any(-1).reshape(len(idx), -1)
+                if c == "T_world_device":
+                    want_v &= ~np.isnan(np.asarray(d["T_device_camera"], np.float32)[idx]).any(-1)[:, None]
+                if not (np.asarray(tab[VALID[c]]) == want_v).all():
+                    fail(f"{split}/{n}: {VALID[c]} differs")
         for j, blob in enumerate(tab["pixels"]):
             im = np.asarray(Image.open(io.BytesIO(blob)).convert("RGB"), np.float32)
             err = np.abs(im - d["pixels"][idx[j]]).mean()

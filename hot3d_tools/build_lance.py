@@ -2,14 +2,18 @@
 
 Uses stable_worldmodel's LanceWriter (same format as Push-T): one episode per
 recording, all 30 fps frames, `pixels` as JPEG (quality 95), other columns as
-float32 lists. NaN = missing pose. Booleans are stored as 0/1.
+float32 lists. Booleans are stored as 0/1.
+LanceDB rejects NaN in float-list columns, so missing poses are stored as 0
+and flagged by head_valid / hand_valid / hand_joints_valid / obj_valid;
+hand_vis_ratio is -1 where HOT3D has no 2D box row.
 Training at 10 fps = frameskip 3 at load time.
 
 Columns:
   pixels                      224x224 RGB (pinhole, not rotated)
   t_sec                       seconds since the first frame of the recording
   T_world_device [7], T_device_camera [7]      [tx,ty,tz,qw,qx,qy,qz]
-  hand_wrist [14] (left 7, right 7), hand_joints [2*J], hand_valid [2], hand_vis_ratio [2]
+  head_valid [1]
+  hand_wrist [14] (left 7, right 7), hand_joints [2*J], hand_valid [2], hand_joints_valid [2], hand_vis_ratio [2]
   obj_pose [O*7], obj_valid [O]                (O and object order: see the sidecar json)
   qa_pass, mask_hand_visible, mask_object_visible, mask_good_exposure
   recording, participant (strings)
@@ -42,18 +46,21 @@ def episode(path):
     d = np.load(path)
     T = len(d["timestamps_ns"])
     ts = d["timestamps_ns"]
-    f = lambda x: np.asarray(x, np.float32).reshape(T, -1)
+    f = lambda x, fill=0.0: np.nan_to_num(np.asarray(x, np.float32).reshape(T, -1), nan=fill)
+    isval = lambda x: ~np.isnan(np.asarray(x, np.float32)).any(-1)
     ep = {
         "pixels": d["pixels"],
         "t_sec": f((ts - ts[0]) / 1e9),
         "T_world_device": f(d["T_world_device"]),
         "T_device_camera": f(d["T_device_camera"]),
+        "head_valid": f(isval(d["T_world_device"]) & isval(d["T_device_camera"])),
         "hand_wrist": f(d["hand_wrist"]),
         "hand_joints": f(d["hand_joints"]),
-        "hand_valid": f(d["hand_valid"]),
-        "hand_vis_ratio": f(d["hand_vis_ratio"]),
+        "hand_valid": f(isval(d["hand_wrist"])),
+        "hand_joints_valid": f(isval(d["hand_joints"])),
+        "hand_vis_ratio": f(d["hand_vis_ratio"], fill=-1.0),
         "obj_pose": f(d["obj_pose"]),
-        "obj_valid": f(d["obj_valid"]),
+        "obj_valid": f(isval(d["obj_pose"])),
         "qa_pass": f(d["qa_pass"]),
         "mask_hand_visible": f(d["mask_hand_visible"]),
         "mask_object_visible": f(d["mask_object_visible"]),
