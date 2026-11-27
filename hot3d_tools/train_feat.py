@@ -10,7 +10,7 @@ The saved model is the epoch with the lowest val-table loss (early stopping, --p
 All features are held on the GPU (1.4 GB for cls_grid fp16).
 
   python hot3d_tools/train_feat.py <feat_dir> <lance_dir> <out_dir> --version cls_grid --variant head
-      [--epochs 40 --batch 256 --lr 3e-4]
+      [--epochs 40 --batch 256 --lr 3e-4 --wd 1e-3 --hidden 384 --depth 6 --mlp-dim 2048 --dropout 0.1]
 """
 import argparse
 import json
@@ -59,6 +59,10 @@ def main():
     ap.add_argument("--wd", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=3072)
     ap.add_argument("--patience", type=int, default=8)
+    ap.add_argument("--hidden", type=int, default=384)
+    ap.add_argument("--depth", type=int, default=6)
+    ap.add_argument("--mlp-dim", type=int, default=2048)
+    ap.add_argument("--dropout", type=float, default=0.1)
     a = ap.parse_args()
     from utils import Hot3dActionTransform
     dev = "cuda"
@@ -82,7 +86,7 @@ def main():
     tf = Hot3dActionTransform(am, asd, a.variant)
     for d in data.values():       # the transform is per raw row (15 numbers): normalize every row once
         d["act"] = tf(torch.from_numpy(d.pop("act_raw"))).to(dev)                   # [N,15]
-    model = FeatWM(version=a.version).to(dev)
+    model = FeatWM(version=a.version, hidden=a.hidden, depth=a.depth, mlp_dim=a.mlp_dim, dropout=a.dropout).to(dev)
     model.mu.copy_(mu); model.sd.copy_(sd)
     st = data["train"]["starts"]
     rng = np.random.default_rng(a.seed)
