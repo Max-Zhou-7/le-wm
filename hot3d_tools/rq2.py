@@ -256,10 +256,17 @@ def main():
         return cache[key]
     res = []
     si, ti = np.nonzero(v)
+    SAMP = dict(p1_rec=np.asarray(D["rec"][R]).astype(str), p1_surprise=sur.astype(np.float32),
+                p1_repeat=rep_.astype(np.float32), p2_rec=np.asarray(D["rec"][St.rows[si, 0]]).astype(str))
     for c, (kind, par) in enumerate(final):
         lk = Rr["lastk"][c][si, ti]
         pe = np.array([mae(int(St.rows[s, t]), int(St.rows[s, l])) for s, t, l in zip(si, ti, lk)])
         skipped = ~Rr["keep"][c][v]
+        key = f"{kind}|1/{FIXED_N[c % len(FIXED_N)]}"
+        SAMP[f"p2|{key}|feat_lewm"] = Rr["ferr"][c][v].astype(np.float32)
+        SAMP[f"p2|{key}|feat_repeat"] = Rr["rerr"][c][v].astype(np.float32)
+        SAMP[f"p2|{key}|pix"] = pe.astype(np.float32)
+        SAMP[f"p2|{key}|kept"] = (~skipped).astype(np.float32)
         res.append(dict(kind=kind, param=par, oracle=kind == "surprise", kept_frac=float(fr[c]), budget=f"1/{FIXED_N[c % len(FIXED_N)]}",
                         feat_err_lewm=float(Rr["ferr"][c][v].mean()), feat_err_repeat=float(Rr["rerr"][c][v].mean()),
                         feat_err_lewm_skipped=float(Rr["ferr"][c][v][skipped].mean()) if skipped.any() else 0.0,
@@ -273,7 +280,9 @@ def main():
     gap_since = (ti - Rr["lastk"][c8][si, ti - 1])
     s8 = Rr["surpr"][c8][si, ti]
     rep["part2"]["surprise_vs_since_kept_N8"] = {int(g): float(s8[gap_since == g].mean()) for g in np.unique(gap_since)}
-    json.dump(rep, open(a.json_out or f"{a.emb_dir}/rq2_{SPL}.json", "w"), indent=1)
+    jo = a.json_out or f"{a.emb_dir}/rq2_{SPL}.json"
+    json.dump(rep, open(jo, "w"), indent=1)
+    np.savez_compressed(jo.replace(".json", "_samples.npz"), **SAMP)
 
     # figures
     import matplotlib

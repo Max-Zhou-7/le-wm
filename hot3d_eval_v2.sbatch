@@ -12,8 +12,8 @@
 #   LeWM:   NAME=lewm_head  POLICY=hot3d_head/weights_epoch_40.pt  EMB_DIR=/scratch/.../emb/hot3d_head_ep40
 #   DINOv2: NAME=dino_best_head POLICY=feat:dino_best_head  EMB_DIR=/scratch/.../emb/dino_best_head (made here)
 # SPLIT=test (only in the approved test run) reuses the val choices: Kalman (q, r) per gap from
-# ~/hot3d_results/v2/<NAME>/gap_eval_val_k32.json and RQ2 thresholds from rq2_val_k32.json.
-# Outputs: <EMB_DIR>/gap_eval_<S>_k32.json, rq2_<S>_k32.json; figs/*_k32_<S>.png; copies in ~/hot3d_results/v2/<NAME>/
+# ~/hot3d_results/v3/<NAME>/gap_eval_val_k32.json and RQ2 thresholds from rq2_val_k32.json.
+# Outputs: <EMB_DIR>/gap_eval_<S>_k32.json, rq2_<S>_k32.json; figs/*_k32_<S>.png; copies in ~/hot3d_results/v3/<NAME>/
 NAME=${1:?}; P=${2:?}; V=${3:?}; O=${4:?}; shift 4
 S=${SPLIT:-val}
 source ~/.bashrc
@@ -23,7 +23,7 @@ cd "$SLURM_SUBMIT_DIR"
 export STABLEWM_HOME=/scratch/$USER/stable-wm
 export HF_HOME=/scratch/$USER/hf_cache
 DS=$STABLEWM_HOME/datasets
-R=~/hot3d_results/v2/$NAME
+R=~/hot3d_results/v3/$NAME
 mkdir -p $R
 if [[ $P == feat:* ]]; then        # DINOv2 model: link the shared features + probes
     ALL=/scratch/$USER/hot3d/emb/dinov2s_all
@@ -45,7 +45,7 @@ python hot3d_tools/gap_eval.py $O $DS /scratch/$USER/hot3d/fisheye512 --split $S
     --out $O/gap_eval_${S}_k32.json $EXTRA
 python hot3d_tools/fig_gap.py $O/gap_eval_${S}_k32.json figs/gap_eval_${NAME}_k32_$S.png "$NAME ($V), $S, gaps 100-3200 ms"
 python hot3d_tools/rq2.py $P $V $O $DS figs/rq2_${NAME}_k32 --json-out $O/rq2_${S}_k32.json $RQ
-cp $O/gap_eval_${S}_k32.json $O/rq2_${S}_k32.json $R/
+cp $O/gap_eval_${S}_k32.json $O/gap_eval_${S}_k32_samples.npz $O/rq2_${S}_k32.json $O/rq2_${S}_k32_samples.npz $R/
 cp figs/*${NAME}_k32* $R/ 2>/dev/null || true
 cp figs/pred_example_${NAME}_val.* $R/ 2>/dev/null || true
 echo "EVAL2 OK $NAME $S"

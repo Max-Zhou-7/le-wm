@@ -3,8 +3,8 @@
 Window (raw 30 fps rows of one recording): anchor row r = last observed frame.
   history  r-27, r-24, ..., r      (10 obs = 1 s at 10 fps; LeWM / B1 use the last 3)
   targets  r+3g, g in {1,2,4,8,16,32}    (100, 200, 400, 800, 1600, 3200 ms)
-Windows whose rows [r-27, r+96] contain a step > 50 ms are skipped (windows.py rule), so every gap
-is scored on the same windows.
+Windows whose rows [r-27, r+99] contain a step > 50 ms are skipped (windows.py rule), so every gap
+is scored on the same windows (r+99 = the first frame after a 32-step gap, for interpolation).
 Anchors every --every rows (default 15 = 0.5 s).
 
 Methods (embedding methods are scored through the frozen probes from probes.py):
@@ -19,12 +19,28 @@ Methods (embedding methods are scored through the frozen probes from probes.py):
                   predicted position put into camera(r+3g) with the true head pose
       kalman_probe  same, observations = probe(z) of the history frames
       hold_gt     last GT wrist position (world), no motion
+  B4  kalman_damped_gt / kalman_damped_probe  same filter, but over the gap the velocity fades:
+                  x_{k+1} = x_k + v_k, v_{k+1} = phi v_k  ->  x_g = x_0 + v_0 (1 - phi^g) / (1 - phi);
+                  (q, r, phi) picked per gap (phi in --phi; phi = 1 is the plain Kalman)
   oracle          probe(z_{r+3g}) = the probe's own error on the real frame
   M_lewm_<variant>  LeWM rollout (lewm_forecast.py; --lewm <policy> --variant <v>)
   M_lewm_<variant>_noise<s>  same, but the wrist-motion inputs are recomputed from wrist positions with
                   Gaussian noise (sigma s cm per axis, per raw frame); --wrist-noise 0.5 1 2. No retraining.
-Kalman q, r: picked per gap on the eval split (grid) unless --kalman-params <json> gives them
-(test MUST use the values frozen on val: {"kalman_gt": {"g1": [q, r], ...}, "kalman_probe": {...}}).
+Kalman q, r (, phi): picked per gap on the eval split (grid) unless --kalman-params <json> gives them
+(test MUST use the values frozen on val: {"kalman_gt": {"g1": [q, r], ...}, "kalman_damped_gt": {"g1": [q, r, phi]}, ...}).
+
+Interpolation ablation (rep["gapall"]): the gap = the g dropped frames r+3j, j = 1..g; the next observed
+frame is e = r+3(g+1). Every dropped frame is scored and errors are averaged per window over j:
+  A_oracle        probe on the real frames (floor)
+  A_repeat        z_r for all j (extrapolation; uses only the past)
+  A_lewm          forecast rollout (extrapolation; uses only the past)
+  I_nearest       z_r or z_e, whichever is closer in time (tie -> z_r)
+  I_linear        (1 - a) z_r + a z_e, a = j / (g + 1)
+  I_lewm_endfix   forecast + linear end correction: f_j + a (z_e - f_{g+1})  (forecast pulled onto the
+                  observed next frame; no retraining)
+
+Per-sample errors (per window; wrist per window and hand) are saved to <out>_samples.npz with the
+recording of each window, for the recording-level bootstrap (boot.py).
 
 Scores per method and gap (only where the target is valid at r+3g; 0 poses never used):
   wrist_cm (left+right pooled, mean / median / frac < 5 cm), obj_cm, up_deg,
@@ -95,14 +111,14 @@ def to_cam(D, rows, p_world):
 
 
 def anchors(D, every):
-    span = (HIST + max(GAPS)) * FS + 1
+    span = (HIST + max(GAPS) + 1) * FS + 1
     out = []
     for e in np.unique(D["ep"]):
         idx = np.flatnonzero(D["ep"] == e)
         ok = valid_starts(D["t"][idx], span)
         for s in range(0, len(ok), every):
             r = idx[s] + HIST * FS
-            if ok[s] and D["hv"][r - HIST * FS: r + max(GAPS) * FS + 1: FS].all():
+            if ok[s] and D["hv"][r - HIST * FS: r + (max(GAPS) + 1) * FS + 1: FS].all():
                 out.append(r)
     return np.asarray(out, np.int64)
 
@@ -143,6 +159,38 @@ def noisy_actions(D, sigma, seed=0):
         ok = A[a, 13 + k] > 0.5
         A[a, 6 + 3 * k: 9 + 3 * k] = np.where(ok[:, None], d, 0.0)
     return A
+
+
+def kalman_filter(obs, ok, q, r):
+    """Vectorized version of kalman_cv's filtering pass (same equations). obs [n,H,3], ok [n,H].
+    Returns the state after the last step [n,2,3] (position, velocity per step); NaN if never observed."""
+    n, H, _ = obs.shape
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+    Q = q * np.array([[1 / 3, 1 / 2], [1 / 2, 1.0]])
+    x = np.zeros((n, 2, 3)); P = np.zeros((n, 2, 2)); init = np.zeros(n, bool)
+    for h in range(H):
+        if init.any():
+            x[init, 0] = x[init, 0] + x[init, 1]
+            P[init] = F @ P[init] @ F.T + Q
+        o = ok[:, h]
+        upd = o & init
+        if upd.any():
+            Pu = P[upd]
+            S = Pu[:, 0, 0] + r
+            K = Pu[:, :, 0] / S[:, None]
+            inn = obs[upd, h] - x[upd, 0]
+            x[upd] = x[upd] + K[:, :, None] * inn[:, None, :]
+            P[upd] = Pu - K[:, :, None] * Pu[:, None, 0, :]
+        new = o & ~init
+        x[new, 0] = obs[new, h]; x[new, 1] = 0.0; P[new] = np.diag([r, 1e3]); init |= new
+    x[~init] = np.nan
+    return x
+
+
+def kalman_extrap(x, g, phi=1.0):
+    """Position g steps ahead from state x [...,2,3]; velocity multiplied by phi every step."""
+    S = float(g) if phi == 1.0 else (1 - phi ** g) / (1 - phi)
+    return x[..., 0, :] + S * x[..., 1, :]
 
 
 def kalman_cv(obs, ok, q, r, g):
@@ -200,6 +248,7 @@ def score_pose(D, probes, tgt, z_hat=None, wrist_hat=None):
         up_gt = np.swapaxes(D["Rwc"][tgt], -1, -2)[:, :, 2]  # world +z in camera coords
         cosang = (probes.up(z_hat) * up_gt).sum(-1).clip(-1, 1)
         res["up_deg"] = summ(np.degrees(np.arccos(cosang)))
+        res["_up"] = np.degrees(np.arccos(cosang))
     return res
 
 
@@ -214,6 +263,7 @@ def main():
     ap.add_argument("--policy", default=None, help="encoder for TimeWarp images (same as emb_dir's)")
     ap.add_argument("--q", type=float, nargs="+", default=[0.1, 1.0, 10.0, 100.0])
     ap.add_argument("--r", type=float, nargs="+", default=[0.1, 1.0, 10.0, 100.0, 1000.0])
+    ap.add_argument("--phi", type=float, nargs="+", default=[0.0, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0])
     ap.add_argument("--no-timewarp", action="store_true")
     ap.add_argument("--max-windows", type=int, default=0)
     ap.add_argument("--lewm", default=None, help="LeWM policy for method M (same checkpoint as emb_dir)")
@@ -241,16 +291,29 @@ def main():
                methods={})
 
     floor = {}
+    SAMP = {}          # (section, method, g) -> {metric: per-window array}; saved for the bootstrap
 
-    def put(method, g, res):
+    def put(method, g, res, section="methods"):
         we = res.pop("_we", None)
+        sm = SAMP.setdefault((section, method, g), {})
+        for k in ["_up", "_emb", "_pix"]:
+            if k in res:
+                sm[k[1:]] = np.asarray(res.pop(k), np.float32)
         if we is not None:
-            if method == "oracle":
-                floor[g] = we
-            d = we - floor[g]
+            sm["wrist"] = np.asarray(we, np.float32)
+            fk = (section, g)
+            if method in ("oracle", "A_oracle"):
+                floor[fk] = we
+            d = we - floor[fk]
+            sm["wrist_above_floor"] = np.asarray(d, np.float32)
             d = d[np.isfinite(d)]
             res["wrist_above_floor"] = float(d.mean()) if len(d) else float("nan")
-        rep["methods"].setdefault(method, {})[f"g{g}"] = res
+        rep.setdefault(section, {}).setdefault(method, {})[f"g{g}"] = res
+
+    def emb(res, zh, zt):
+        e = np.linalg.norm(zh - zt, axis=1) / zscale
+        res["emb_err"] = float(e.mean()); res["_emb"] = e
+        return res
 
     hist = np.stack([R - FS * h for h in range(HIST, -1, -1)], 1)  # [n,10], last = r
     # Kalman / hold: observations in world frame (cm), GT or probe
@@ -260,43 +323,52 @@ def main():
     obs_pr = (np.einsum("nhij,nhkj->nhki", D["Rwc"][hist], pw_cam) + D["twc"][hist][:, :, None]) * 100.0
     ok_pr = np.ones_like(ok_gt)
 
-    def kalman_score(obs, ok, q, r, g, tgt):
-        pred_w = np.stack([kalman_cv(obs[:, :, k], ok[:, :, k], q, r, g) for k in range(2)], 1) / 100.0
+    FX = {}
+
+    def kstate(tag, q, r):           # filtered state per hand [n,2,2,3], cached (does not depend on the gap)
+        if (tag, q, r) not in FX:
+            obs, ok = (obs_gt, ok_gt) if tag == "gt" else (obs_pr, ok_pr)
+            FX[(tag, q, r)] = np.stack([kalman_filter(obs[:, :, k], ok[:, :, k], q, r) for k in range(2)], 1)
+        return FX[(tag, q, r)]
+
+    def kalman_score(src, q, r, g, tgt, phi=1.0):
+        pred_w = kalman_extrap(kstate(src, q, r), g, phi) / 100.0
         return score_pose(D, probes, tgt, wrist_hat=to_cam(D, tgt, pred_w))
 
     for g in GAPS:
         tgt = R + FS * g
         z_true = Z[tgt]
         for name, zh in [("oracle", z_true), ("B0_repeat", Z[R]), ("B1_linear", Z[R] + g * (Z[R] - Z[R - FS]))]:
-            res = score_pose(D, probes, tgt, z_hat=zh)
-            res["emb_err"] = float(np.linalg.norm(zh - z_true, axis=1).mean() / zscale)
-            put(name, g, res)
-        put("hold_gt", g, kalman_score(obs_gt, ok_gt, 0.0, 1e-6, 0, tgt))
-        for tag, obs, ok in [("kalman_gt", obs_gt, ok_gt), ("kalman_probe", obs_pr, ok_pr)]:
+            put(name, g, emb(score_pose(D, probes, tgt, z_hat=zh), zh, z_true))
+        put("hold_gt", g, kalman_score("gt", 0.0, 1e-6, 0, tgt))
+        for tag, src, damped in [("kalman_gt", "gt", False), ("kalman_probe", "probe", False),
+                                 ("kalman_damped_gt", "gt", True), ("kalman_damped_probe", "probe", True)]:
             if KP:
                 best = tuple(KP[tag][f"g{g}"])
-                grid = {best: kalman_score(obs, ok, best[0], best[1], g, tgt)}
+                grid = {best: kalman_score(src, best[0], best[1], g, tgt, best[2] if damped else 1.0)}
             else:
                 grid = {}
                 for q in a.q:
                     for r in a.r:
-                        grid[(q, r)] = kalman_score(obs, ok, q, r, g, tgt)
+                        for phi in (a.phi if damped else [1.0]):
+                            key = (q, r, phi) if damped else (q, r)
+                            grid[key] = kalman_score(src, q, r, g, tgt, phi)
                 best = min(grid, key=lambda k: grid[k]["wrist_cm"].get("mean", np.inf))
             res = dict(grid[best], q=best[0], r=best[1], params_from=a.kalman_params or f"grid on {a.split}")
-            rep.setdefault("kalman_params", {}).setdefault(tag, {})[f"g{g}"] = [best[0], best[1]]
+            if damped:
+                res["phi"] = best[2]
+            rep.setdefault("kalman_params", {}).setdefault(tag, {})[f"g{g}"] = [float(x) for x in best]
             put(tag, g, res)
         print(f"g={g} done ({time.time() - t0:.0f}s)", flush=True)
 
     if a.lewm:
         from lewm_forecast import Forecaster, raw_actions
         Fc = Forecaster(a.lewm, a.variant, a.lance_dir)
-        K = max(GAPS)
+        K = max(GAPS) + 1             # +1: the forecast of the next observed frame (interpolation end fix)
         zf = Fc.rollout(np.stack([Z[R - 2 * FS], Z[R - FS], Z[R]], 1), raw_actions(D, R, K), K)
         for g in GAPS:
             tgt = R + FS * g
-            res = score_pose(D, probes, tgt, z_hat=zf[:, g - 1])
-            res["emb_err"] = float(np.linalg.norm(zf[:, g - 1] - Z[tgt], axis=1).mean() / zscale)
-            put(f"M_lewm_{a.variant}", g, res)
+            put(f"M_lewm_{a.variant}", g, emb(score_pose(D, probes, tgt, z_hat=zf[:, g - 1]), zf[:, g - 1], Z[tgt]))
         print(f"LeWM rollout done ({time.time() - t0:.0f}s)", flush=True)
         if a.wrist_noise:
             A0 = noisy_actions(D, 0.0)
@@ -305,14 +377,41 @@ def main():
             assert dev0 < 1e-2, "recomputed wrist actions do not match the stored column"
         for sig in a.wrist_noise:
             Dn = dict(D, action=noisy_actions(D, sig, seed=0))
-            zf = Fc.rollout(np.stack([Z[R - 2 * FS], Z[R - FS], Z[R]], 1), raw_actions(Dn, R, K), K)
+            zfn = Fc.rollout(np.stack([Z[R - 2 * FS], Z[R - FS], Z[R]], 1), raw_actions(Dn, R, K), K)
             for g in GAPS:
                 tgt = R + FS * g
-                res = score_pose(D, probes, tgt, z_hat=zf[:, g - 1])
-                res["emb_err"] = float(np.linalg.norm(zf[:, g - 1] - Z[tgt], axis=1).mean() / zscale)
+                res = emb(score_pose(D, probes, tgt, z_hat=zfn[:, g - 1]), zfn[:, g - 1], Z[tgt])
                 res["wrist_noise_cm"] = sig
                 put(f"M_lewm_{a.variant}_noise{sig:g}", g, res)
             print(f"LeWM rollout with wrist noise {sig} cm done ({time.time() - t0:.0f}s)", flush=True)
+            del zfn
+
+    # interpolation ablation: score every dropped frame j = 1..g, average per window
+    import warnings
+    for g in GAPS:
+        e_row = R + FS * (g + 1)
+        meth = {"A_oracle": lambda j: Z[R + FS * j], "A_repeat": lambda j: Z[R],
+                "I_nearest": (lambda j, g=g: Z[R] if j <= (g + 1) / 2 else Z[e_row]),
+                "I_linear": (lambda j, g=g: (1 - j / (g + 1)) * Z[R] + (j / (g + 1)) * Z[e_row])}
+        if a.lewm:
+            meth["A_lewm"] = lambda j: zf[:, j - 1]
+            meth["I_lewm_endfix"] = (lambda j, g=g: zf[:, j - 1] + (j / (g + 1)) * (Z[e_row] - zf[:, g]))
+        for name, fn in meth.items():
+            we, up, ee = [], [], []
+            for j in range(1, g + 1):
+                tj = R + FS * j
+                zh = fn(j)
+                r_ = score_pose(D, probes, tj, z_hat=zh)
+                we.append(r_["_we"]); up.append(r_["_up"])
+                ee.append(np.linalg.norm(zh - Z[tj], axis=1) / zscale)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                we = np.nanmean(np.stack(we), 0); up = np.nanmean(np.stack(up), 0)
+            ee = np.mean(np.stack(ee), 0)
+            res = dict(wrist_cm=summ(we[np.isfinite(we)]), up_deg=summ(up), emb_err=float(ee.mean()),
+                       _we=we, _up=up, _emb=ee)
+            put(name, g, res, section="gapall")
+        print(f"interpolation g={g} done ({time.time() - t0:.0f}s)", flush=True)
 
     if not a.no_timewarp:
         import torch
@@ -326,7 +425,7 @@ def main():
         cache = {}
         VARS = ["B2_timewarp", "B2_timewarp_fill"]   # black where uncovered / unwarped last frame there
         zs = {(v, g): np.zeros((len(R), Z.shape[1]), np.float32) for v in VARS for g in GAPS}
-        pix = {(v, g): [] for v in VARS for g in GAPS}
+        pix = {(v, g): np.full(len(R), np.nan) for v in VARS for g in GAPS}
         unc = {g: [] for g in GAPS}
         dec = lambda b: decode_jpeg(torch.frombuffer(bytearray(b), dtype=torch.uint8)).permute(1, 2, 0).numpy()
         for i, r in enumerate(R):
@@ -355,7 +454,7 @@ def main():
                 refs = [dec(b).astype(np.float32) for b in blobs]
                 for v in VARS:
                     for g, o, ref in zip(GAPS, outs[v], refs):
-                        pix[(v, g)].append(np.abs(o.astype(np.float32) - ref).mean() / 255)
+                        pix[(v, g)][i] = np.abs(o.astype(np.float32) - ref).mean() / 255
             x = torch.from_numpy(np.stack(outs[VARS[0]] + outs[VARS[1]])).permute(0, 3, 1, 2)
             x = ((x.float() / 255 - MEAN) / STD).to(dev)
             with torch.no_grad(), torch.autocast(dev, dtype=torch.bfloat16, enabled=dev == "cuda"):
@@ -368,23 +467,25 @@ def main():
         for v in VARS:
             for g in GAPS:
                 tgt = R + FS * g
-                res = score_pose(D, probes, tgt, z_hat=zs[(v, g)])
-                res["emb_err"] = float(np.linalg.norm(zs[(v, g)] - Z[tgt], axis=1).mean() / zscale)
-                res["pix_mae"] = float(np.mean(pix[(v, g)]))
+                res = emb(score_pose(D, probes, tgt, z_hat=zs[(v, g)]), zs[(v, g)], Z[tgt])
+                res["pix_mae"] = float(np.nanmean(pix[(v, g)])); res["_pix"] = pix[(v, g)]
                 res["uncovered_frac"] = float(np.mean(unc[g]))
                 put(v, g, res)
         # repeat-last pixel error for reference
         for g in GAPS:
-            idx = R[::20]
-            e = []
-            for r in idx:
+            e = np.full(len(R), np.nan)
+            for i in range(0, len(R), 20):
+                r = R[i]
                 b = D["ds"].take([int(r), int(r + FS * g)], columns=["pixels"])["pixels"].to_pylist()
                 a0, a1 = [decode_jpeg(torch.frombuffer(bytearray(x), dtype=torch.uint8)).float() for x in b]
-                e.append((a0 - a1).abs().mean().item() / 255)
-            rep["methods"]["B0_repeat"][f"g{g}"]["pix_mae"] = float(np.mean(e))
+                e[i] = (a0 - a1).abs().mean().item() / 255
+            rep["methods"]["B0_repeat"][f"g{g}"]["pix_mae"] = float(np.nanmean(e))
+            SAMP[("methods", "B0_repeat", g)]["pix"] = e.astype(np.float32)
 
     out = a.out or f"{a.emb_dir}/gap_eval_{a.split}.json"
     json.dump(rep, open(out, "w"), indent=1)
+    arrs = {f"{sec}|{m}|g{g}|{k}": v for (sec, m, g), d in SAMP.items() for k, v in d.items()}
+    np.savez_compressed(out.replace(".json", "_samples.npz"), rec=np.asarray(D["rec"][R]).astype(str), R=R, **arrs)
     print(f"\n{'method':14s} " + " ".join(f"{'g' + str(g) + ' wrist cm':>16s}" for g in GAPS))
     print("(mean wrist cm, + above the oracle floor)")
     for m, v in rep["methods"].items():
