@@ -81,7 +81,7 @@ class Stream:
         for i, sg in enumerate(segs):
             self.rows[i, :len(sg)] = sg
             self.Zs[i, :len(sg)] = torch.from_numpy(Z[sg])
-            acts = D["action"][sg[:, None] + np.arange(FS)[None]]           # [n,3,15]
+            acts = D["action"][np.minimum(sg[:, None] + np.arange(FS)[None], D["N"] - 1)]   # [n,3,15]; last one unused
             hv = acts[..., 12] > 0.5
             self.rot[i, :len(sg)] = (np.linalg.norm(acts[..., 3:6], axis=-1) * hv).sum(1)
             a45 = acts.reshape(len(sg), 1, FS * 15)
