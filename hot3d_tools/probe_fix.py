@@ -72,9 +72,12 @@ def fit_ridge(Xtr, Ytr, Xva, Yva, lams=LAMS, std_y=True):
     return lam, (lambda X: X @ Wt * ys + ym)
 
 
-def fit_mlp(Xtr, Ytr, Xva, Yva, hidden=256, lr=1e-3, wd=1e-4, epochs=300, patience=15, seed=0):
+def fit_mlp(Xtr, Ytr, Xva, Yva, hidden=256, lr=1e-3, wd=1e-4, epochs=300, patience=15, seed=0, fixed_epochs=0):
+    """Early stopping on (Xva, Yva); or, with fixed_epochs > 0, train exactly that many epochs (no val)."""
     import torch
     torch.manual_seed(seed)
+    if fixed_epochs:
+        Xva, Yva, epochs, patience = Xtr[:2000], Ytr[:2000], fixed_epochs, 10 ** 9
     ym, ys = Ytr.mean(0), Ytr.std(0) + 1e-9
     xt = torch.tensor(Xtr, dtype=torch.float32)
     yt = torch.tensor((Ytr - ym) / ys, dtype=torch.float32)
@@ -95,7 +98,7 @@ def fit_mlp(Xtr, Ytr, Xva, Yva, hidden=256, lr=1e-3, wd=1e-4, epochs=300, patien
             ev = err(pred(xv), Yva).mean()
             et = err(pred(xt[:20000]), Ytr[:20000]).mean()
         hist.append((ep, float(et), float(ev)))
-        if ev < best - 1e-4:
+        if ev < best - 1e-4 or fixed_epochs:
             best, bad = ev, 0
             state = {k: v.clone() for k, v in net.state_dict().items()}
         else:
@@ -233,11 +236,125 @@ def fix(a):
     print("FIX OK")
 
 
+def participants(lance_dir, split, rows):
+    import lance
+    ds = lance.dataset(f"{lance_dir}/hot3d_{split}_fov110.lance")
+    rec = np.asarray(ds.take(rows.tolist(), columns=["recording"])["recording"].to_pylist())
+    return np.array([r.split("_")[0] for r in rec])
+
+
+def lopo(a):
+    """Leave-one-participant-out over the 7 GT training participants (train + val tables; val
+    subsampled to stride 3 like train). Fold p: test on p; inner participant q (next in the list)
+    picks lambda / MLP early stopping; fit on the other 5. Then, for reporting only: fit on all 7
+    (lambda = the most common fold choice, MLP epochs = median fold best epoch) and score test,
+    split into a constant offset per test participant vs the remainder. Test chooses nothing."""
+    S = {sp: load(a.emb_dir, a.lance_dir, sp) for sp in ["train", "val", "test"]}
+    for sp, s in S.items():
+        s["P"] = participants(a.lance_dir, sp, s["rows"])
+    v = S["val"]
+    keep = np.flatnonzero(v["rows"] % 3 == 0)
+    A = {k: (np.concatenate([S["train"][k], v[k][keep]]) if isinstance(v[k], np.ndarray) and len(v[k]) == len(v["X"])
+             else S["train"][k]) for k in S["train"]}
+    T = S["test"]
+    mu, sd = A["X"].mean(0), A["X"].std(0) + 1e-6
+    for s in (A, T):
+        s["Xn"] = (s["X"] - mu) / sd
+        s["Xs"] = add_bias(s["Xn"])
+    plist = sorted(set(A["P"]))
+    lams = [10.0 ** p for p in range(-6, 5)]
+    rep = dict(emb_dir=a.emb_dir, participants=plist, mask="clean", folds={}, test={})
+    for k, h in enumerate("LR"):
+        for tgt, key, unit in [("3d", "W", "cm"), ("2d", "uv", "px")]:
+            name = f"{h}_{tgt}"
+            Y = A[key][:, k]
+            M = A["clean"][:, k]
+            folds, lam_pick, ep_pick = {}, [], []
+            for i, p in enumerate(plist):
+                q = plist[(i + 1) % len(plist)]
+                te, inn = M & (A["P"] == p), M & (A["P"] == q)
+                tr = M & (A["P"] != p) & (A["P"] != q)
+                trq = M & (A["P"] != p)                       # all 6 for the final fold fit
+                mean = Y[trq].mean(0)
+                lam, _ = fit_ridge(A["Xs"][tr], Y[tr], A["Xs"][inn], Y[inn], lams)
+                _, f = fit_ridge(A["Xs"][trq], Y[trq], A["Xs"][inn], Y[inn], [lam])   # refit on all 6
+                g, hist = fit_mlp(A["Xn"][tr], Y[tr], A["Xn"][inn], Y[inn])
+                be = int(np.argmin([x[2] for x in hist])) + 1
+                lam_pick.append(lam); ep_pick.append(be)
+                folds[p] = dict(n=int(te.sum()), guess_mean=float(err(mean, Y[te]).mean()),
+                                linear=float(err(f(A["Xs"][te]), Y[te]).mean()),
+                                mlp=float(err(g(A["Xn"][te]), Y[te]).mean()), lam=lam, mlp_best_epoch=be)
+                print(f"{name} fold {p} (inner {q}) n {te.sum()}: mean {folds[p]['guess_mean']:.2f} "
+                      f"linear {folds[p]['linear']:.2f} (lam {lam:g}) mlp {folds[p]['mlp']:.2f} (ep {be})", flush=True)
+            avg = {m: float(np.mean([f_[m] for f_ in folds.values()])) for m in ["guess_mean", "linear", "mlp"]}
+            rep["folds"][name] = dict(unit=unit, per_participant=folds, avg_over_participants=avg)
+            # reporting only: fit on all 7, score test, offset vs remainder per test participant
+            lam = max(set(lam_pick), key=lam_pick.count)
+            ep = int(np.median(ep_pick))
+            _, f = fit_ridge(A["Xs"][M], Y[M], A["Xs"][M][:10], Y[M][:10], [lam])
+            g, _ = fit_mlp(A["Xn"][M], Y[M], None, None, fixed_epochs=ep)
+            mean = Y[M].mean(0)
+            Mt, Yt = T["clean"][:, k], T[key][:, k]
+            preds = dict(guess_mean=np.broadcast_to(mean, Yt.shape), linear=f(T["Xs"]), mlp=g(T["Xn"]))
+            trep = dict(lam=lam, mlp_epochs=ep)
+            for m, P in preds.items():
+                tot, per = err(P[Mt], Yt[Mt]).mean(), {}
+                rem_all = []
+                for p in sorted(set(T["P"][Mt])):
+                    mm = Mt & (T["P"] == p)
+                    res = P[mm] - Yt[mm]
+                    off = res.mean(0)
+                    rem = err(res - off, 0)
+                    rem_all.append(rem)
+                    per[p] = dict(n=int(mm.sum()), total=float(err(res, 0).mean()), offset=off.round(2).tolist(),
+                                  offset_norm=float(np.linalg.norm(off)), remainder=float(rem.mean()))
+                trep[m] = dict(total=float(tot), remainder=float(np.concatenate(rem_all).mean()), per_participant=per)
+            rep["test"][name] = trep
+            print(f"{name} LOPO avg: mean {avg['guess_mean']:.2f} linear {avg['linear']:.2f} mlp {avg['mlp']:.2f} {unit}", flush=True)
+            for m in preds:
+                t = trep[m]
+                print(f"{name} TEST {m:10s} total {t['total']:.2f} remainder {t['remainder']:.2f} | offsets " +
+                      " ".join(f"{p}: {v_['offset']} (|{v_['offset_norm']:.1f}|)" for p, v_ in t["per_participant"].items()),
+                      flush=True)
+    json.dump(rep, open(f"{a.emb_dir}/probe_lopo.json", "w"), indent=1)
+    if a.fig:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        names = ["L_3d", "R_3d", "L_2d", "R_2d"]
+        fig, ax = plt.subplots(2, 4, figsize=(18, 7.5))
+        for j, nm in enumerate(names):
+            fo = rep["folds"][nm]["per_participant"]
+            xs = np.arange(len(plist))
+            for i, m in enumerate(["guess_mean", "linear", "mlp"]):
+                ax[0, j].bar(xs + (i - 1) * 0.27, [fo[p][m] for p in plist], 0.27, label=m)
+            ax[0, j].set_xticks(xs, plist, fontsize=7)
+            ax[0, j].set_title(f"{nm} leave-one-participant-out ({rep['folds'][nm]['unit']})", fontsize=9)
+            ax[0, j].legend(fontsize=7)
+            t = rep["test"][nm]
+            tps = list(t["linear"]["per_participant"])
+            xs = np.arange(len(tps))
+            for i, m in enumerate(["guess_mean", "linear", "mlp"]):
+                tot = [t[m]["per_participant"][p]["total"] for p in tps]
+                rem = [t[m]["per_participant"][p]["remainder"] for p in tps]
+                ax[1, j].bar(xs + (i - 1) * 0.27, tot, 0.27, alpha=0.35, color=f"C{i}")
+                ax[1, j].bar(xs + (i - 1) * 0.27, rem, 0.27, color=f"C{i}", label=f"{m} (solid = after removing offset)")
+            ax[1, j].set_xticks(xs, tps)
+            ax[1, j].set_title(f"{nm} TEST (report only): total (light) vs remainder (solid)", fontsize=9)
+            ax[1, j].legend(fontsize=6)
+        fig.suptitle("Wrist probes on z, clean frames. Top: LOPO over the 7 training participants (choice). "
+                     "Bottom: test, offset per participant vs remainder (not used to choose).", fontsize=9)
+        fig.tight_layout()
+        fig.savefig(a.fig, dpi=100)
+        print("SAVED", a.fig)
+    print("LOPO OK")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["diag", "fix"])
+    ap.add_argument("cmd", choices=["diag", "fix", "lopo"])
     ap.add_argument("emb_dir")
     ap.add_argument("lance_dir")
     ap.add_argument("--fig", default="")
     a = ap.parse_args()
-    diag(a) if a.cmd == "diag" else fix(a)
+    {"diag": diag, "fix": fix, "lopo": lopo}[a.cmd](a)
