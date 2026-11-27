@@ -6,6 +6,7 @@ Samples = LeWM clips: 4 frames at frameskip 3 (rows s, s+3, s+6, s+9) whose raw 
 (utils.Hot3dActionTransform, valid-row stats of the train table, variant none / head / head_hands).
 Loss = MSE(pred(z_0..2, a_0..2), z_1..3) in standardized feature space (num_preds = 1, as LeWM).
 Hold-out: random 10% of clips (seed 3072, like train.py), plus the val TABLE loss each epoch.
+The saved model is the epoch with the lowest val-table loss (early stopping, --patience); last epoch in <out>/last.
 All features are held on the GPU (1.4 GB for cls_grid fp16).
 
   python hot3d_tools/train_feat.py <feat_dir> <lance_dir> <out_dir> --version cls_grid --variant head
@@ -56,6 +57,7 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--wd", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=3072)
+    ap.add_argument("--patience", type=int, default=8)
     a = ap.parse_args()
     from utils import Hot3dActionTransform
     dev = "cuda"
@@ -118,6 +120,7 @@ def main():
         return sum(ls) / len(idx)
 
     hist, t0 = [], time.time()
+    best, best_ep, bad = float("inf"), 0, 0
     print(f"version {a.version} variant {a.variant}: {len(tr_idx)} train clips, {steps_ep} steps/epoch, {a.epochs} epochs", flush=True)
     for ep in range(a.epochs):
         p = np.random.default_rng(a.seed + ep).permutation(len(tr_idx))
@@ -136,9 +139,20 @@ def main():
         hist.append(h)
         print(f"epoch {ep + 1}/{a.epochs} train {h['train']:.4f} holdout {h['holdout']:.4f} val-table {h['val_table']:.4f} "
               f"({h['sec']:.0f}s)", flush=True)
-        if (ep + 1) % 10 == 0 or ep + 1 == a.epochs:
+        # keep the epoch with the lowest val-TABLE loss (other recordings; the 10% hold-out shares
+        # recordings with train and keeps falling while the val table rises = overfitting)
+        if h["val_table"] < best:
+            best, best_ep, bad = h["val_table"], ep + 1, 0
             model.save(a.out_dir)
-    json.dump(dict(args=vars(a), hist=hist), open(f"{a.out_dir}/train_hist.json", "w"), indent=1)
+        else:
+            bad += 1
+        model.save(f"{a.out_dir}/last")
+        if bad >= a.patience:
+            print(f"early stop: best val-table {best:.4f} at epoch {best_ep}", flush=True)
+            break
+    json.dump(dict(args=vars(a), hist=hist, best_epoch=best_ep, best_val_table=best),
+              open(f"{a.out_dir}/train_hist.json", "w"), indent=1)
+    print(f"best val-table {best:.4f} at epoch {best_ep} (saved in {a.out_dir}; last epoch in {a.out_dir}/last)")
     print("TRAIN FEAT OK", a.out_dir)
 
 
