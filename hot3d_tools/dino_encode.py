@@ -47,9 +47,10 @@ def main():
     ap.add_argument("--chunk", type=int, default=256)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--model", default="facebook/dinov2-small")
+    ap.add_argument("--allow-test", action="store_true", help="only for the single approved test run")
     a = ap.parse_args()
     import lance
-    assert "test" not in a.splits, "no test runs (user rule)"
+    assert "test" not in a.splits or a.allow_test, "test only in the approved test job (--allow-test)"
     os.makedirs(a.out_dir, exist_ok=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_dino(a.model).to(dev)

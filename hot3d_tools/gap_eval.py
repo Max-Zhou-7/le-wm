@@ -2,8 +2,9 @@
 
 Window (raw 30 fps rows of one recording): anchor row r = last observed frame.
   history  r-27, r-24, ..., r      (10 obs = 1 s at 10 fps; LeWM / B1 use the last 3)
-  targets  r+3g, g in {1,2,4,8}    (100, 200, 400, 800 ms)
-Windows whose rows [r-27, r+24] contain a step > 50 ms are skipped (windows.py rule).
+  targets  r+3g, g in {1,2,4,8,16,32}    (100, 200, 400, 800, 1600, 3200 ms)
+Windows whose rows [r-27, r+96] contain a step > 50 ms are skipped (windows.py rule), so every gap
+is scored on the same windows.
 Anchors every --every rows (default 15 = 0.5 s).
 
 Methods (embedding methods are scored through the frozen probes from probes.py):
@@ -20,9 +21,16 @@ Methods (embedding methods are scored through the frozen probes from probes.py):
       hold_gt     last GT wrist position (world), no motion
   oracle          probe(z_{r+3g}) = the probe's own error on the real frame
   M_lewm_<variant>  LeWM rollout (lewm_forecast.py; --lewm <policy> --variant <v>)
+  M_lewm_<variant>_noise<s>  same, but the wrist-motion inputs are recomputed from wrist positions with
+                  Gaussian noise (sigma s cm per axis, per raw frame); --wrist-noise 0.5 1 2. No retraining.
+Kalman q, r: picked per gap on the eval split (grid) unless --kalman-params <json> gives them
+(test MUST use the values frozen on val: {"kalman_gt": {"g1": [q, r], ...}, "kalman_probe": {...}}).
 
 Scores per method and gap (only where the target is valid at r+3g; 0 poses never used):
   wrist_cm (left+right pooled, mean / median / frac < 5 cm), obj_cm, up_deg,
+  wrist_above_floor = mean over the same (window, hand) samples of err(method) - err(oracle), where
+      oracle = the probe on the real target frame (the probe's own floor). For GT-based methods
+      (hold_gt, kalman_gt) that do not go through the probe, it can be negative.
   emb_err = ||z_hat - z_{r+3g}|| / mean ||z - mean z||  (embedding methods),
   pix_mae (timewarp vs the stored frame, /255).
 
@@ -43,7 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from actions import pose7_to_Rt  # noqa: E402
 from windows import valid_starts  # noqa: E402
 
-GAPS = [1, 2, 4, 8]
+GAPS = [1, 2, 4, 8, 16, 32]
 HIST = 9  # history steps before r (10 obs incl. r)
 FS = 3    # frameskip (10 fps)
 
@@ -120,6 +128,23 @@ class Probes:
         return u / np.linalg.norm(u, axis=-1, keepdims=True).clip(1e-9)
 
 
+def noisy_actions(D, sigma, seed=0):
+    """Action table with the wrist-motion parts (6:12) recomputed from wrist positions + Gaussian noise
+    (sigma cm per axis, independent per raw frame), exactly as actions.compute_actions: displacement
+    row t -> t+1 rotated into camera(t). Validity flags unchanged; invalid parts stay 0.
+    sigma = 0 reproduces the stored column (checked)."""
+    A = D["action"].copy()
+    rng = np.random.default_rng(seed)
+    W = D["wrist_w"] * 100.0 + rng.normal(0.0, sigma, D["wrist_w"].shape)     # [N,2,3] world cm
+    a, b = np.arange(D["N"] - 1), np.arange(1, D["N"])
+    RcT = np.swapaxes(D["Rwc"][a], -1, -2)
+    for k in range(2):
+        d = np.einsum("tij,tj->ti", RcT, W[b, k] - W[a, k])
+        ok = A[a, 13 + k] > 0.5
+        A[a, 6 + 3 * k: 9 + 3 * k] = np.where(ok[:, None], d, 0.0)
+    return A
+
+
 def kalman_cv(obs, ok, q, r, g):
     """obs [n,H,3] (one obs per 10 fps step, last = anchor), ok [n,H]. Constant velocity,
     dt = 1 step. Returns predicted position g steps after the last step [n,3] (NaN if no obs)."""
@@ -164,7 +189,9 @@ def score_pose(D, probes, tgt, z_hat=None, wrist_hat=None):
     ok_w = D["hav"][tgt] & D["hv"][tgt][:, None]
     gt_w = to_cam(D, tgt, D["wrist_w"][tgt])
     w = probes.wrist(z_hat) if z_hat is not None else wrist_hat
-    res["wrist_cm"] = summ(np.linalg.norm(w - gt_w, axis=-1)[ok_w])
+    e = np.linalg.norm(w - gt_w, axis=-1)
+    res["wrist_cm"] = summ(e[ok_w])
+    res["_we"] = np.where(ok_w, e, np.nan)           # per (window, hand), for the floor; not saved
     if z_hat is not None:
         fitted = probes.P["obj_fitted"]
         ok_o = D["ov"][tgt] & D["hv"][tgt][:, None] & fitted[None]
@@ -191,7 +218,14 @@ def main():
     ap.add_argument("--max-windows", type=int, default=0)
     ap.add_argument("--lewm", default=None, help="LeWM policy for method M (same checkpoint as emb_dir)")
     ap.add_argument("--variant", default="head_hands", help="action variant the LeWM policy was trained with")
+    ap.add_argument("--kalman-params", default=None, help="json with fixed (q, r) per gap (frozen on val)")
+    ap.add_argument("--wrist-noise", type=float, nargs="*", default=[], help="LeWM with noisy wrist-motion inputs (cm)")
+    ap.add_argument("--out", default=None, help="output json (default <emb_dir>/gap_eval_<split>.json)")
     a = ap.parse_args()
+    assert a.split != "test" or a.kalman_params, "test needs --kalman-params frozen on val"
+    KP = json.load(open(a.kalman_params)) if a.kalman_params else None
+    if KP and "kalman_params" in KP:          # a val gap_eval json: use the values it chose
+        KP = KP["kalman_params"]
     t0 = time.time()
     D = load_split(a.lance_dir, a.split, a.fov, extra=["action"] if a.lewm else [])
     Z = np.load(f"{a.emb_dir}/emb_{a.split}.npy").astype(np.float32)
@@ -206,7 +240,16 @@ def main():
     rep = dict(split=a.split, n_windows=int(len(R)), every=a.every, emb_dir=a.emb_dir, gaps_ms=[100 * g for g in GAPS],
                methods={})
 
+    floor = {}
+
     def put(method, g, res):
+        we = res.pop("_we", None)
+        if we is not None:
+            if method == "oracle":
+                floor[g] = we
+            d = we - floor[g]
+            d = d[np.isfinite(d)]
+            res["wrist_above_floor"] = float(d.mean()) if len(d) else float("nan")
         rep["methods"].setdefault(method, {})[f"g{g}"] = res
 
     hist = np.stack([R - FS * h for h in range(HIST, -1, -1)], 1)  # [n,10], last = r
@@ -230,12 +273,17 @@ def main():
             put(name, g, res)
         put("hold_gt", g, kalman_score(obs_gt, ok_gt, 0.0, 1e-6, 0, tgt))
         for tag, obs, ok in [("kalman_gt", obs_gt, ok_gt), ("kalman_probe", obs_pr, ok_pr)]:
-            grid = {}
-            for q in a.q:
-                for r in a.r:
-                    grid[(q, r)] = kalman_score(obs, ok, q, r, g, tgt)
-            best = min(grid, key=lambda k: grid[k]["wrist_cm"].get("mean", np.inf))
-            res = dict(grid[best], q=best[0], r=best[1])
+            if KP:
+                best = tuple(KP[tag][f"g{g}"])
+                grid = {best: kalman_score(obs, ok, best[0], best[1], g, tgt)}
+            else:
+                grid = {}
+                for q in a.q:
+                    for r in a.r:
+                        grid[(q, r)] = kalman_score(obs, ok, q, r, g, tgt)
+                best = min(grid, key=lambda k: grid[k]["wrist_cm"].get("mean", np.inf))
+            res = dict(grid[best], q=best[0], r=best[1], params_from=a.kalman_params or f"grid on {a.split}")
+            rep.setdefault("kalman_params", {}).setdefault(tag, {})[f"g{g}"] = [best[0], best[1]]
             put(tag, g, res)
         print(f"g={g} done ({time.time() - t0:.0f}s)", flush=True)
 
@@ -250,6 +298,21 @@ def main():
             res["emb_err"] = float(np.linalg.norm(zf[:, g - 1] - Z[tgt], axis=1).mean() / zscale)
             put(f"M_lewm_{a.variant}", g, res)
         print(f"LeWM rollout done ({time.time() - t0:.0f}s)", flush=True)
+        if a.wrist_noise:
+            A0 = noisy_actions(D, 0.0)
+            dev0 = float(np.abs(A0[:, 6:12] - D["action"][:, 6:12]).max())
+            print(f"noise check: sigma 0 vs stored wrist actions, max diff {dev0:.2e} cm", flush=True)
+            assert dev0 < 1e-2, "recomputed wrist actions do not match the stored column"
+        for sig in a.wrist_noise:
+            Dn = dict(D, action=noisy_actions(D, sig, seed=0))
+            zf = Fc.rollout(np.stack([Z[R - 2 * FS], Z[R - FS], Z[R]], 1), raw_actions(Dn, R, K), K)
+            for g in GAPS:
+                tgt = R + FS * g
+                res = score_pose(D, probes, tgt, z_hat=zf[:, g - 1])
+                res["emb_err"] = float(np.linalg.norm(zf[:, g - 1] - Z[tgt], axis=1).mean() / zscale)
+                res["wrist_noise_cm"] = sig
+                put(f"M_lewm_{a.variant}_noise{sig:g}", g, res)
+            print(f"LeWM rollout with wrist noise {sig} cm done ({time.time() - t0:.0f}s)", flush=True)
 
     if not a.no_timewarp:
         import torch
@@ -320,15 +383,17 @@ def main():
                 e.append((a0 - a1).abs().mean().item() / 255)
             rep["methods"]["B0_repeat"][f"g{g}"]["pix_mae"] = float(np.mean(e))
 
-    out = f"{a.emb_dir}/gap_eval_{a.split}.json"
+    out = a.out or f"{a.emb_dir}/gap_eval_{a.split}.json"
     json.dump(rep, open(out, "w"), indent=1)
     print(f"\n{'method':14s} " + " ".join(f"{'g' + str(g) + ' wrist cm':>16s}" for g in GAPS))
+    print("(mean wrist cm, + above the oracle floor)")
     for m, v in rep["methods"].items():
         cells = []
         for g in GAPS:
-            w = v.get(f"g{g}", {}).get("wrist_cm", {})
-            cells.append(f"{w.get('mean', float('nan')):7.2f} ({w.get('frac_lt_5', float('nan')):.2f})")
-        print(f"{m:14s} " + " ".join(f"{c:>16s}" for c in cells))
+            x = v.get(f"g{g}", {})
+            w = x.get("wrist_cm", {})
+            cells.append(f"{w.get('mean', float('nan')):7.2f} (+{x.get('wrist_above_floor', float('nan')):.2f})")
+        print(f"{m:24s} " + " ".join(f"{c:>16s}" for c in cells))
     print(f"SAVED {out}\nGAP EVAL OK")
 
 

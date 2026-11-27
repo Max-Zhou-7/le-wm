@@ -1,11 +1,12 @@
-"""RQ2 (val only): surprise vs frames skipped, and surprise-based vs fixed-rate capture at equal budgets.
+"""RQ2 (val; test only with --params frozen on val): surprise vs frames skipped, and surprise-based vs fixed-rate capture at equal budgets.
 
 Model: a LeWM checkpoint + its stride-1 val embeddings (head-only variant by default). 10 fps timeline
 (every 3rd raw row). Surprise of frame t = ||z_hat_t - z_t|| / zscale, z_hat_t = LeWM forecast from the
 3 previous timeline entries and the GT head actions (zscale = mean ||z - mean z|| over val, the same
 normalization as gap_eval's emb_err).
 
-Part 1 (anchors every 15 rows, as gap_eval): open-loop rollout k = 1..8 steps (100-800 ms skipped);
+Part 1 (anchors every 15 rows, the same windows as gap_eval): open-loop rollout k = 1..32 steps
+(100-3200 ms skipped);
 surprise vs k, plus repeat-last distance ||z_t - z_t+k||.
 
 Part 2 (streaming): each recording is cut into segments at any raw time step > 50 ms. The first 3
@@ -13,7 +14,13 @@ frames of a segment are always kept. At every later step t the device holds buf[
 for kept frames, its own forecasts for skipped ones), forecasts z_hat_t, then decides whether to keep
 frame t:
   fixed N      keep every N-th frame
-  surprise     keep if surprise(t) > tau   (needs z_t: "encode every frame, store/transmit few")
+  surprise     ORACLE: keep if surprise(t) > tau. Uses the surprise of the frame being decided, i.e.
+               needs z_t before deciding ("encode every frame, store/transmit few"); a capture policy
+               cannot know it before capturing.
+  lastsurp     REALISTIC: keep if s_last * (t - t_last) > tau, where s_last = surprise measured at the
+               last KEPT frame (known: that frame was captured and compared with its forecast) and
+               t - t_last = steps since then (surprise grows ~linearly with frames skipped).
+               Before the first measurement s_last = median surprise of the fixed-rate run.
   head-motion  keep if the head rotation accumulated since the last kept frame > theta deg (from the
                head action; needs no image)
 Kept: buf[t] = z_t; skipped: buf[t] = z_hat_t. tau / theta are set so the kept fraction matches
@@ -39,7 +46,7 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(HERE))
-from gap_eval import FS, anchors, load_split  # noqa: E402
+from gap_eval import FS, GAPS, anchors, load_split  # noqa: E402
 from lewm_forecast import Forecaster, raw_actions  # noqa: E402
 from windows import valid_starts  # noqa: E402
 
@@ -78,6 +85,7 @@ class Stream:
         A = F.model.action_encoder.embed[-1].out_features
         self.AE = torch.zeros(S, J, A)
         self.rot = np.zeros((S, J))                       # head rotation (deg) of step j -> j+1
+        self.s0 = 0.15                                    # s_last before any measurement (set from data)
         for i, sg in enumerate(segs):
             self.rows[i, :len(sg)] = sg
             self.Zs[i, :len(sg)] = torch.from_numpy(Z[sg])
@@ -101,6 +109,7 @@ class Stream:
         ferr = np.zeros((C, S, J))
         rerr = np.zeros((C, S, J))                                          # repeat-last-kept z error
         acc = np.zeros((C, S))
+        slast = np.full((C, S), self.s0)
         kind = np.array([k for k, _ in configs]); par = np.array([p for _, p in configs], float)
         for t in range(3, J):
             alive = t < self.L                                              # [S]
@@ -118,6 +127,8 @@ class Stream:
             m = kind == "fixed"; k[m] = np.broadcast_to(((t % par[m].astype(int)) == 0)[:, None], (m.sum(), len(si)))
             m = kind == "surprise"; k[m] = s[m] > par[m][:, None]
             m = kind == "head"; k[m] = acc[m][:, si] > par[m][:, None]
+            m = kind == "lastsurp"; k[m] = slast[m][:, si] * (t - lastk[m][:, si, t - 1]) > par[m][:, None]
+            slast[:, si] = np.where(k, s, slast[:, si])
             new = torch.where(torch.from_numpy(k).to(dev)[..., None], zt.expand_as(pred), pred)
             buf[:, si] = torch.cat([buf[:, si, 1:], new[:, :, None]], 2)
             keep[:, si, t] = k
@@ -158,18 +169,23 @@ def main():
     ap.add_argument("lance_dir")
     ap.add_argument("out_prefix")
     ap.add_argument("--grid", type=int, default=40)
+    ap.add_argument("--split", default="val")
+    ap.add_argument("--params", default=None, help="rq2_val.json: reuse its thresholds (required for test)")
+    ap.add_argument("--json-out", default=None, help="default <emb_dir>/rq2_<split>.json")
     a = ap.parse_args()
+    assert a.split != "test" or a.params, "test needs --params frozen on val"
+    SPL = a.split
     t0 = time.time()
-    D = load_split(a.lance_dir, "val", 110, extra=["action"])
-    Z = np.load(f"{a.emb_dir}/emb_val.npy").astype(np.float32)
+    D = load_split(a.lance_dir, SPL, 110, extra=["action"])
+    Z = np.load(f"{a.emb_dir}/emb_{SPL}.npy").astype(np.float32)
     assert len(Z) == D["N"]
     zscale = float(np.linalg.norm(Z - Z.mean(0), axis=1).mean())
     F = Forecaster(a.policy, a.variant, a.lance_dir)
-    rep = dict(policy=a.policy, variant=a.variant, split="val", zscale=zscale,
+    rep = dict(policy=a.policy, variant=a.variant, split=SPL, zscale=zscale, params_from=a.params or "matched on this split",
                note="feature-space distance is LeWM's own training objective, so it favours LeWM-based fills")
 
     # Part 1
-    K = 8
+    K = max(GAPS)
     R = anchors(D, 15)
     zh = np.stack([Z[R - 2 * FS], Z[R - FS], Z[R]], 1)
     zf = F.rollout(zh, raw_actions(D, R, K), K)                             # [n,K,D]
@@ -192,22 +208,33 @@ def main():
     St = Stream(F, D, Z, segs, zscale)
     print(f"part2: {len(segs)} segments, {int(sum(St.L))} timeline frames", flush=True)
     fixed = [("fixed", n) for n in FIXED_N]
-    Rf = St.run(fixed)
-    ffrac = frac(Rf)
-    s_all = Rf["surpr"][0][Rf["valid"]]
-    taus = np.quantile(s_all, np.linspace(0.02, 0.98, a.grid))
-    thetas = np.quantile(St.rot[St.rot > 0], np.linspace(0.02, 0.98, a.grid)) * np.linspace(0.5, 12, a.grid)
-    grid = [("surprise", float(x)) for x in taus] + [("head", float(x)) for x in thetas]
-    Rg = St.run(grid)
-    gfrac = frac(Rg)
-    print(f"grid pass done ({time.time() - t0:.0f}s): surprise frac {gfrac[:a.grid].min():.3f}-{gfrac[:a.grid].max():.3f}, "
-          f"head frac {gfrac[a.grid:].min():.3f}-{gfrac[a.grid:].max():.3f}", flush=True)
-    final = list(fixed)
-    for kind, lo in [("surprise", 0), ("head", a.grid)]:
-        p = np.array([g[1] for g in grid[lo:lo + a.grid]]); fr = gfrac[lo:lo + a.grid]
-        o = np.argsort(fr)
-        for f in ffrac:
-            final.append((kind, float(np.interp(f, fr[o], p[o]))))
+    KINDS = ["surprise", "head", "lastsurp"]
+    if a.params:
+        P = json.load(open(a.params))["part2"]
+        St.s0 = P["s0"]
+        final = [(r["kind"], r["param"]) for r in P["results"]]
+    else:
+        Rf = St.run(fixed)
+        ffrac = frac(Rf)
+        s_all = Rf["surpr"][0][Rf["valid"]]
+        St.s0 = float(np.median(s_all))
+        taus = np.quantile(s_all, np.linspace(0.02, 0.98, a.grid))
+        thetas = np.quantile(St.rot[St.rot > 0], np.linspace(0.02, 0.98, a.grid)) * np.linspace(0.5, 12, a.grid)
+        lts = np.geomspace(0.005, 10.0, a.grid)
+        grid = ([("surprise", float(x)) for x in taus] + [("head", float(x)) for x in thetas]
+                + [("lastsurp", float(x)) for x in lts])
+        Rg = St.run(grid)
+        gfrac = frac(Rg)
+        print(f"grid pass done ({time.time() - t0:.0f}s): " + ", ".join(
+            f"{kd} frac {gfrac[i * a.grid:(i + 1) * a.grid].min():.3f}-{gfrac[i * a.grid:(i + 1) * a.grid].max():.3f}"
+            for i, kd in enumerate(KINDS)), flush=True)
+        final = list(fixed)
+        for i, kind in enumerate(KINDS):
+            lo = i * a.grid
+            p = np.array([g[1] for g in grid[lo:lo + a.grid]]); fr = gfrac[lo:lo + a.grid]
+            o = np.argsort(fr)
+            for f in ffrac:
+                final.append((kind, float(np.interp(f, fr[o], p[o]))))
     Rr = St.run(final)
     fr = frac(Rr)
     # pixels: real t vs last kept
@@ -233,32 +260,34 @@ def main():
         lk = Rr["lastk"][c][si, ti]
         pe = np.array([mae(int(St.rows[s, t]), int(St.rows[s, l])) for s, t, l in zip(si, ti, lk)])
         skipped = ~Rr["keep"][c][v]
-        res.append(dict(kind=kind, param=par, kept_frac=float(fr[c]), budget=f"1/{FIXED_N[c % len(FIXED_N)]}",
+        res.append(dict(kind=kind, param=par, oracle=kind == "surprise", kept_frac=float(fr[c]), budget=f"1/{FIXED_N[c % len(FIXED_N)]}",
                         feat_err_lewm=float(Rr["ferr"][c][v].mean()), feat_err_repeat=float(Rr["rerr"][c][v].mean()),
                         feat_err_lewm_skipped=float(Rr["ferr"][c][v][skipped].mean()) if skipped.any() else 0.0,
                         pix_mae_repeat=float(pe.mean()), pix_mae_repeat_skipped=float(pe[skipped].mean()) if skipped.any() else 0.0))
         r = res[-1]
         print(f"{kind:9s} {r['budget']:4s} param {par:8.3f} kept {r['kept_frac']:.3f} | feature err LeWM fill {r['feat_err_lewm']:.4f} "
               f"repeat fill {r['feat_err_repeat']:.4f} | pixel MAE x255 {255 * r['pix_mae_repeat']:.2f}", flush=True)
-    rep["part2"] = dict(n_segments=len(segs), n_frames=int(v.sum()), results=res)
+    rep["part2"] = dict(n_segments=len(segs), n_frames=int(v.sum()), results=res, s0=St.s0)
     # surprise vs frames since last kept (fixed N = 8 run)
     c8 = FIXED_N.index(8)
     gap_since = (ti - Rr["lastk"][c8][si, ti - 1])
     s8 = Rr["surpr"][c8][si, ti]
     rep["part2"]["surprise_vs_since_kept_N8"] = {int(g): float(s8[gap_since == g].mean()) for g in np.unique(gap_since)}
-    json.dump(rep, open(f"{a.emb_dir}/rq2_val.json", "w"), indent=1)
+    json.dump(rep, open(a.json_out or f"{a.emb_dir}/rq2_{SPL}.json", "w"), indent=1)
 
     # figures
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     ks = np.arange(1, K + 1) * 100
+    tag = SPL
     fig, ax = plt.subplots(1, 3, figsize=(16, 4.3))
     ax[0].plot(ks, sur.mean(0), "o-", label="LeWM forecast (mean)")
     ax[0].fill_between(ks, np.percentile(sur, 25, 0), np.percentile(sur, 75, 0), alpha=0.25, label="LeWM 25-75%")
     ax[0].plot(ks, rep_.mean(0), "s--", color="gray", label="repeat last frame (mean)")
     ax[0].set_xlabel("frames skipped (ms)"); ax[0].set_ylabel("surprise ||z_hat - z|| / zscale")
-    ax[0].set_title(f"Surprise vs gap, {len(R)} val windows", fontsize=9); ax[0].legend(fontsize=7)
+    ax[0].set_title(f"Surprise vs gap, {len(R)} {SPL} windows", fontsize=9); ax[0].legend(fontsize=7)
+    ax[0].set_xscale("log"); ax[0].set_xticks([100, 200, 400, 800, 1600, 3200]); ax[0].set_xticklabels(["100", "200", "400", "800", "1600", "3200"])
     kk = 3
     ax[1].scatter(turn[:, kk], sur[:, kk], s=3, alpha=0.3)
     ax[1].set_xlabel(f"head turn during the gap (deg), k = {kk + 1} (400 ms)"); ax[1].set_ylabel("surprise")
@@ -267,41 +296,44 @@ def main():
     ax[2].plot(g, [rep["part2"]["surprise_vs_since_kept_N8"][x] for x in g], "o-")
     ax[2].set_xlabel("frames since the last kept frame (streaming, keep 1 in 8)"); ax[2].set_ylabel("surprise")
     ax[2].set_title("Streaming: surprise grows while frames are skipped", fontsize=9)
-    fig.suptitle(f"RQ2 surprise, LeWM {a.variant} ({a.policy}), val. Feature distance = LeWM's own objective (favours LeWM).", fontsize=9)
-    fig.tight_layout(); fig.savefig(f"{a.out_prefix}_surprise_vs_skip_val.png", dpi=110)
+    fig.suptitle(f"RQ2 surprise, LeWM {a.variant} ({a.policy}), {SPL}. Feature distance = LeWM's own objective (favours LeWM).", fontsize=9)
+    fig.tight_layout(); fig.savefig(f"{a.out_prefix}_surprise_vs_skip_{tag}.png", dpi=110)
 
     fig, ax = plt.subplots(1, 3, figsize=(16, 4.3))
-    cols = {"fixed": "tab:gray", "surprise": "tab:red", "head": "tab:blue"}
-    names = {"fixed": "fixed rate", "surprise": "surprise trigger (needs z_t)", "head": "head-motion trigger"}
-    for kind in ["fixed", "surprise", "head"]:
+    cols = {"fixed": "tab:gray", "surprise": "tab:red", "head": "tab:blue", "lastsurp": "tab:orange"}
+    names = {"fixed": "fixed rate", "surprise": "surprise ORACLE (needs the current frame)", "head": "head-motion trigger",
+             "lastsurp": "surprise, realistic (last measured x frames since)"}
+    for kind in ["fixed", "surprise", "lastsurp", "head"]:
         rr = sorted([r for r in res if r["kind"] == kind], key=lambda r: r["kept_frac"])
         x = [r["kept_frac"] for r in rr]
-        ax[0].plot(x, [r["feat_err_lewm"] for r in rr], "o-", color=cols[kind], label=names[kind])
-        ax[1].plot(x, [r["feat_err_repeat"] for r in rr], "o-", color=cols[kind], label=names[kind])
-        ax[2].plot(x, [255 * r["pix_mae_repeat"] for r in rr], "o-", color=cols[kind], label=names[kind])
+        ls_ = "o--" if kind == "surprise" else "o-"
+        ax[0].plot(x, [r["feat_err_lewm"] for r in rr], ls_, color=cols[kind], label=names[kind])
+        ax[1].plot(x, [r["feat_err_repeat"] for r in rr], ls_, color=cols[kind], label=names[kind])
+        ax[2].plot(x, [255 * r["pix_mae_repeat"] for r in rr], ls_, color=cols[kind], label=names[kind])
     for j, (t_, yl) in enumerate([("feature error, LeWM forecast fills skipped frames", "||z_fill - z|| / zscale"),
                                   ("feature error, last kept frame fills", "||z_fill - z|| / zscale"),
                                   ("pixel error, last kept frame fills", "MAE (/255)")]):
         ax[j].set_xlabel("fraction of frames kept (budget)"); ax[j].set_ylabel(yl); ax[j].set_title(t_, fontsize=9)
         ax[j].legend(fontsize=7); ax[j].set_xscale("log")
-    fig.suptitle(f"RQ2 capture at equal budgets, val ({rep['part2']['n_frames']} frames at 10 fps). "
+    fig.suptitle(f"RQ2 capture at equal budgets, {SPL} ({rep['part2']['n_frames']} frames at 10 fps). "
                  "Feature error favours LeWM (its own objective); pixel error is neutral.", fontsize=9)
-    fig.tight_layout(); fig.savefig(f"{a.out_prefix}_capture_val.png", dpi=110)
+    fig.tight_layout(); fig.savefig(f"{a.out_prefix}_capture_{tag}.png", dpi=110)
 
     # timeline example: longest segment, budget 1/4
     s0 = int(np.argmax(St.L)); n4 = FIXED_N.index(4)
-    cf = n4; cs = len(FIXED_N) + n4
+    cf = n4; cs = len(FIXED_N) + n4; cl = 3 * len(FIXED_N) + n4
     L0 = min(St.L[s0], 300)
-    fig, ax = plt.subplots(2, 1, figsize=(15, 5), sharex=True)
+    fig, ax = plt.subplots(3, 1, figsize=(15, 7), sharex=True)
     tt = np.arange(3, L0) / 10
-    for j, (c, nm) in enumerate([(cf, "fixed 1 in 4"), (cs, f"surprise trigger (kept {fr[cs]:.2f})")]):
+    for j, (c, nm) in enumerate([(cf, "fixed 1 in 4"), (cs, f"surprise ORACLE trigger (kept {fr[cs]:.2f})"),
+                                 (cl, f"surprise realistic trigger (kept {fr[cl]:.2f})")]):
         ax[j].plot(tt, Rr["surpr"][c][s0, 3:L0], lw=0.8, label="surprise of the frame (vs forecast)")
         ax[j].plot(tt, Rr["ferr"][c][s0, 3:L0], lw=0.8, label="error after the decision")
         kk_ = np.flatnonzero(Rr["keep"][c][s0, 3:L0])
         ax[j].plot(tt[kk_], np.zeros(len(kk_)), "|", color="k", ms=10, label="kept frame")
         ax[j].set_ylabel("/ zscale"); ax[j].set_title(nm, fontsize=9); ax[j].legend(fontsize=7, loc="upper right")
-    ax[1].set_xlabel(f"time (s), val {D['rec'][St.rows[s0, 0]]}")
-    fig.tight_layout(); fig.savefig(f"{a.out_prefix}_timeline_val.png", dpi=110)
+    ax[2].set_xlabel(f"time (s), {SPL} {D['rec'][St.rows[s0, 0]]}")
+    fig.tight_layout(); fig.savefig(f"{a.out_prefix}_timeline_{tag}.png", dpi=110)
     print("SAVED figures", a.out_prefix, f"({time.time() - t0:.0f}s)")
     print("RQ2 OK")
 
