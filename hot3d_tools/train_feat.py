@@ -67,14 +67,15 @@ def main():
         F = np.load(f"{a.feat_dir}/emb_{split}.npy", mmap_mode="r")[:, :Dm]
         assert (rows == np.arange(len(rows))).all(), "need stride-1 features"
         starts, act = table(a.lance_dir, split)
-        data[split] = dict(F=torch.from_numpy(np.ascontiguousarray(F)).to(dev), starts=starts,
-                           act=torch.from_numpy(act).to(dev))
+        data[split] = dict(F=torch.from_numpy(np.ascontiguousarray(F)).to(dev), starts=starts, act_raw=act)
         print(f"{split}: {len(rows)} frames, {len(starts)} clips", flush=True)
     Ftr = data["train"]["F"].float()
     mu, sd = Ftr.mean(0), Ftr.std(0) + 1e-6
     del Ftr
     am, asd = action_norm(a.lance_dir)
     tf = Hot3dActionTransform(am, asd, a.variant)
+    for d in data.values():       # the transform is per raw row (15 numbers): normalize every row once
+        d["act"] = tf(torch.from_numpy(d.pop("act_raw"))).to(dev)                   # [N,15]
     model = FeatWM(version=a.version).to(dev)
     model.mu.copy_(mu); model.sd.copy_(sd)
     st = data["train"]["starts"]
@@ -89,8 +90,7 @@ def main():
         fr = s[:, None] + FS * torch.arange(T, device=dev)[None]                    # [B,4]
         z = (d["F"][fr].float() - mu) / sd
         ar = s[:, None] + torch.arange(T * FS, device=dev)[None]                     # [B,12]
-        acts = d["act"][ar].reshape(len(s) * T, FS * 15).cpu()                       # transform is CPU torch
-        acts = tf(acts).reshape(len(s), T, FS * 15).to(dev)
+        acts = d["act"][ar].reshape(len(s), T, FS * 15)
         return z, acts
 
     def loss_of(z, acts):
