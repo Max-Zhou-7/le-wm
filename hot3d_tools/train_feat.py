@@ -29,6 +29,7 @@ from lewm_forecast import action_norm  # noqa: E402
 from windows import valid_starts  # noqa: E402
 
 FS, T = 3, 4
+BF16 = True
 
 
 def table(lance_dir, split):
@@ -61,6 +62,9 @@ def main():
     a = ap.parse_args()
     from utils import Hot3dActionTransform
     dev = "cuda"
+    global BF16
+    BF16 = torch.cuda.is_bf16_supported()       # V100/T4: plain fp32 (small model, fine)
+    print("GPU", torch.cuda.get_device_name(0), "bf16" if BF16 else "fp32", flush=True)
     torch.manual_seed(a.seed)
     Dm = VERSIONS[a.version]
     data = {}
@@ -114,7 +118,7 @@ def main():
         ls = []
         for b in range(0, len(idx), 1024):
             z, acts = batch(split, idx[b:b + 1024])
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=BF16):
                 ls.append(loss_of(z, acts).float().item() * len(z))
         model.train()
         return sum(ls) / len(idx)
@@ -127,7 +131,7 @@ def main():
         run = 0.0
         for i in range(steps_ep):
             z, acts = batch("train", tr_idx[p[i * a.batch:(i + 1) * a.batch]])
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=BF16):
                 loss = loss_of(z, acts)
             opt.zero_grad(set_to_none=True)
             loss.backward()
