@@ -46,6 +46,10 @@ class Chunks(torch.utils.data.Dataset):
 
 
 def load_model(policy):
+    if policy.startswith("feat:"):                     # predictor on frozen DINOv2 features (featwm.py)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from featwm import load_featwm
+        return load_featwm(policy.split(":", 1)[1])
     import stable_worldmodel as swm
     rand = policy.startswith("random:")
     model = swm.wm.utils.load_pretrained(policy.split(":", 1)[1] if rand else policy)

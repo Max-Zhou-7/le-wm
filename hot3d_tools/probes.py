@@ -100,17 +100,27 @@ def main():
     ap.add_argument("--up", default="z", help="world up axis, e.g. z, -y")
     ap.add_argument("--qa", action="store_true")
     ap.add_argument("--min-obj-frames", type=int, default=500)
+    ap.add_argument("--no-test", action="store_true", help="never load test; report on val instead")
+    ap.add_argument("--train-stride", type=int, default=1, help="subsample train embeddings")
     a = ap.parse_args()
     S = {}
-    for split in ["train", "val", "test"]:
-        E = np.load(f"{a.emb_dir}/emb_{split}.npy").astype(np.float64)
+    for split in ["train", "val"] + ([] if a.no_test else ["test"]):
+        E = np.load(f"{a.emb_dir}/emb_{split}.npy", mmap_mode="r")
         rows = np.load(f"{a.emb_dir}/rows_{split}.npy")
+        if split == "train" and a.train_stride > 1:
+            E, rows = E[::a.train_stride], rows[::a.train_stride]
+        E = np.asarray(E, np.float64)
         S[split] = dict(X=E, **targets(a.lance_dir, split, a.fov, rows, a.up, a.qa))
         print(f"{split}: {len(E)} frames", flush=True)
+    if a.no_test:
+        S["test"] = S["val"]          # reported numbers are then on val (lambda also picked on val)
+        rep_split = "val"
+    else:
+        rep_split = "test"
     mu, sd = S["train"]["X"].mean(0), S["train"]["X"].std(0) + 1e-6
-    for s in S.values():
+    for s in {id(v): v for v in S.values()}.values():
         s["X"] = add_bias((s["X"] - mu) / sd)
-    rep, W = dict(emb_dir=a.emb_dir, up=a.up, qa=a.qa), dict(mu=mu, sd=sd)
+    rep, W = dict(emb_dir=a.emb_dir, up=a.up, qa=a.qa, reported_on=rep_split), dict(mu=mu, sd=sd)
 
     # wrists: one probe per hand (own masks)
     for k, name in enumerate(["left", "right"]):
