@@ -49,3 +49,22 @@ for A in ax.flat:
     A.set_xlabel("gap (ms)"); A.legend(fontsize=6)
 fig.suptitle(f"Gap eval with recording-level bootstrap CIs ({a.split})", fontsize=10)
 fig.tight_layout(); fig.savefig(a.out, dpi=110); print("SAVED", a.out)
+
+# Segment split figure: rows = segments, cols = models; wrist error with 95% CI bands.
+segs = ["interaction", "head_only", "other"]
+if any(f"seg:{s}|n" in load(panels[0][0]) for s in segs):
+    fig, ax = plt.subplots(3, 3, figsize=(19, 13), sharey="row")
+    for c, (model, lm) in enumerate(panels):
+        B = load(model)
+        for r_, s in enumerate(segs):
+            for m in ["oracle", "B0_repeat", "B2_timewarp_fill", "kalman_damped_probe", "kalman_damped_gt", lm]:
+                band(ax[r_, c], B, f"seg:{s}|methods", m, "wrist")
+            n = B.get(f"seg:{s}|n", {})
+            ax[r_, c].set_title(f"{model}, segment {s}: wrist error (cm), 95% CI; windows "
+                                + ",".join(str(n.get(f'g{g}', 0)) for g in G), fontsize=8)
+            ax[r_, c].set_ylim(0, 35)
+    for A in ax.flat:
+        A.set_xscale("log"); A.set_xticks(ms); A.set_xticklabels([str(x) for x in ms], fontsize=7)
+        A.set_xlabel("gap (ms)"); A.legend(fontsize=6)
+    fig.suptitle(f"Gap eval by segment ({a.split}); recording-level bootstrap CIs", fontsize=10)
+    fig.tight_layout(); o2 = a.out.replace(".png", "_segments.png"); fig.savefig(o2, dpi=100); print("SAVED", o2)

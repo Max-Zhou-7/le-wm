@@ -3,10 +3,11 @@
 
 Over the gap interval (raw rows r, r+3, ..., r+3g; 10 fps), compared with row r:
   1 interaction : some object (valid at r and at the step) moves >= OBJ_M in the world frame
-  2 head-only   : not interaction, every valid wrist stays within WRIST_M (world), and the head turns >= HEAD_DEG
-                  or moves >= HEAD_M
-  0 other       : everything else (still scenes; hands moving without moving an object)
-Thresholds frozen on val (2026-11-28). Anchors = gap_eval.anchors (same windows, same order; checked in boot.py).
+  2 head-only   : not interaction, and the head turns >= HEAD_DEG or moves >= HEAD_M (hands may move, no object moves)
+  0 other       : no object moves and the head is still
+Thresholds frozen on val (2026-11-28). A first version also required both wrists within 5 cm (world) for head-only;
+on val that left only 2-4% of windows (wrists move with the body), so the wrist condition was dropped (wrist motion
+is still saved). Anchors = gap_eval.anchors (same windows, same order; checked in boot.py).
 """
 import argparse
 import os
@@ -17,7 +18,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gap_eval import FS, GAPS, anchors, load_split  # noqa: E402
 
-OBJ_M, WRIST_M, HEAD_DEG, HEAD_M = 0.02, 0.05, 5.0, 0.05
+OBJ_M, HEAD_DEG, HEAD_M = 0.02, 5.0, 0.05
 NAMES = {0: "other", 1: "interaction", 2: "head_only"}
 
 
@@ -38,7 +39,7 @@ def labels(D, R, g):
     lab = np.zeros(len(R), np.int8)
     inter = obj >= OBJ_M
     lab[inter] = 1
-    lab[~inter & (wr < WRIST_M) & ((ang >= HEAD_DEG) | (tm >= HEAD_M))] = 2
+    lab[~inter & ((ang >= HEAD_DEG) | (tm >= HEAD_M))] = 2
     return lab, dict(obj=obj, wrist=wr, head_deg=ang, head_m=tm)
 
 

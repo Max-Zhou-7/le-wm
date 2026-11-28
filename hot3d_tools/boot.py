@@ -30,6 +30,21 @@ class Boot:
         m = {n: i for i, n in enumerate(self.names)}
         return np.array([m[r] for r in rec])
 
+    def means(self, x, rid):
+        """-> (point mean, per-resample means [B] (NaN if a resample has no sample), n) or None."""
+        x = np.asarray(x, np.float64)
+        r = np.broadcast_to(rid.reshape((-1,) + (1,) * (x.ndim - 1)), x.shape).reshape(-1)
+        x = x.reshape(-1)
+        m = np.isfinite(x)
+        if not m.any():
+            return None
+        nr = len(self.names)
+        S = np.bincount(r[m], x[m], minlength=nr); C = np.bincount(r[m], minlength=nr).astype(float)
+        with np.errstate(all="ignore"):
+            WS, WC = self.W @ S, self.W @ C
+            bs = np.where(WC > 0, WS / np.maximum(WC, 1e-12), np.nan)
+        return float(S.sum() / C.sum()), bs, int(m.sum())
+
     def stat(self, x, rid):
         """x [n] or [n,k] per window/frame; rid [n]. -> (mean, lo, hi, n)."""
         x = np.asarray(x, np.float64)
@@ -58,7 +73,33 @@ def f(s, d=1, sign=False):
     return f"{fmt.format(s['mean'])} [{fmt.format(s['lo'])}, {fmt.format(s['hi'])}]"
 
 
-def gap_tables(name, S, bt, L, out):
+SEGS = [(1, "interaction"), (2, "head_only"), (0, "other")]
+REL_THR = 2.0   # cm above the oracle floor (frozen on val 2026-11-28)
+
+
+def horizon(bt, xs, rid, thr=REL_THR):
+    """Reliability horizon: the largest gap g such that the mean above-floor wrist error is <= thr at every gap
+    up to g (0 = not reliable even at 100 ms). xs: list over G of per-sample arrays. -> point (ms), CI (ms), share."""
+    pts, bss = [], []
+    for x in xs:
+        mm = bt.means(x, rid)
+        if mm is None:
+            return None
+        pts.append(mm[0]); bss.append(mm[1])
+    def h(v):
+        out = 0
+        for g, e in zip(G, v):
+            if not (e <= thr):
+                break
+            out = 100 * g
+        return out
+    p = h(pts)
+    hb = np.array([h(v) for v in np.stack(bss, 1)])
+    lo, hi = np.percentile(hb, [2.5, 97.5], method="nearest")
+    return dict(ms=p, lo=int(lo), hi=int(hi), share=float(np.mean(hb == p)))
+
+
+def gap_tables(name, S, bt, L, out, seg=None):
     rid = bt.rid(S["rec"])
     keys = [k for k in S.files if "|" in k]
     get = lambda sec, m, g, met: S[f"{sec}|{m}|g{g}|{met}"] if f"{sec}|{m}|g{g}|{met}" in S.files else None
@@ -81,6 +122,36 @@ def gap_tables(name, S, bt, L, out):
                     b = get(sec, base, g, met)
                     dd = bt.diff(x, b, rid) if (b is not None and m != base and met != "wrist_above_floor") else None
                     res[f"{sec}|{m}|g{g}|{met}"] = dict(stat=st, diff_vs_repeat=dd)
+    # segment split (labels from segments.py, same windows) and reliability horizons
+    rel = {}
+    if seg is not None:
+        assert (np.asarray(seg["rec"]) == np.asarray(S["rec"])).all() and (seg["R"] == S["R"]).all(), "segment windows differ"
+    seg_list = [(None, "all")] + (SEGS if seg is not None else [])
+    for sid, sname in seg_list:
+        msk = {g: (np.ones(len(rid), bool) if sid is None else seg[f"lab_g{g}"] == sid) for g in G}
+        cut = lambda x, g: np.where(msk[g].reshape((-1,) + (1,) * (np.ndim(x) - 1)), x, np.nan)
+        for m in order:
+            if m == "oracle":
+                continue
+            xs = [get("methods", m, g, "wrist_above_floor") for g in G]
+            if all(x is not None for x in xs):
+                rel[f"{sname}|{m}"] = horizon(bt, [cut(x, g) for x, g in zip(xs, G)], rid)
+        if sid is None:
+            continue
+        for sec, base, ms in [("methods", "B0_repeat", order), ("gapall", "A_repeat", ["A_oracle", "A_repeat", "A_lewm",
+                                                                                           "I_nearest", "I_linear", "I_lewm_endfix"])]:
+            for m in ms:
+                for g in G:
+                    for met in ["wrist", "wrist_above_floor"]:
+                        x = get(sec, m, g, met)
+                        if x is None:
+                            continue
+                        b = get(sec, base, g, met)
+                        res[f"seg:{sname}|{sec}|{m}|g{g}|{met}"] = dict(
+                            stat=bt.stat(cut(x, g), rid),
+                            diff_vs_repeat=bt.diff(cut(x, g), b, rid) if (b is not None and m != base and met == "wrist") else None)
+            res[f"seg:{sname}|n"] = {f"g{g}": int(msk[g].sum()) for g in G}
+    res["reliability"] = rel
     json.dump(res, open(out, "w"), indent=1)
     R = lambda sec, m, g, met, which="stat": (res.get(f"{sec}|{m}|g{g}|{met}") or {}).get(which)
     hdr = "| method | " + " | ".join(f"{100 * g} ms" for g in G) + " |\n|---|" + "---|" * len(G)
@@ -122,6 +193,40 @@ def gap_tables(name, S, bt, L, out):
             for m in am:
                 if m != "A_repeat":
                     L.append(f"| {m} | " + " | ".join(f(R("gapall", m, g, met, "diff_vs_repeat"), d, True) for g in G) + " |")
+    if rel:
+        cols = [n for _, n in seg_list]
+        L.append(f"\n**Reliability horizon: largest gap with mean wrist error above the oracle floor <= {REL_THR:g} cm at every "
+                 "gap up to it (ms) [95% bootstrap interval] (share of resamples that give the same value)**\n")
+        L.append("| method | " + " | ".join(cols) + " |\n|---|" + "---|" * len(cols))
+        for m in order:
+            if f"all|{m}" not in rel:
+                continue
+            cell = lambda h: "–" if h is None else f"{h['ms']} [{h['lo']}, {h['hi']}] ({h['share']:.2f})"
+            L.append(f"| {m} | " + " | ".join(cell(rel.get(f"{c}|{m}")) for c in cols) + " |")
+    if seg is not None:
+        for _, sname in SEGS:
+            n = res[f"seg:{sname}|n"]
+            L.append(f"\n**Segment {sname}: wrist error (cm), last frame of the gap; Δ = paired difference vs repeat-last**  "
+                     f"(windows per gap: {', '.join(str(n[f'g{g}']) for g in G)})\n\n" + hdr)
+            for m in order:
+                st = R(f"seg:{sname}|methods", m, 1, "wrist")
+                if st is None:
+                    continue
+                L.append(f"| {m} | " + " | ".join(f(R(f"seg:{sname}|methods", m, g, "wrist"), 1) for g in G) + " |")
+            for m in order:
+                if m == "B0_repeat" or R(f"seg:{sname}|methods", m, 1, "wrist", "diff_vs_repeat") is None:
+                    continue
+                L.append(f"| Δ {m} | " + " | ".join(f(R(f"seg:{sname}|methods", m, g, "wrist", "diff_vs_repeat"), 1, True)
+                                                    for g in G) + " |")
+            L.append(f"\n*Segment {sname}: wrist error above the oracle floor (cm)*\n\n" + hdr)
+            for m in order:
+                if m == "oracle" or R(f"seg:{sname}|methods", m, 1, "wrist_above_floor") is None:
+                    continue
+                L.append(f"| {m} | " + " | ".join(f(R(f"seg:{sname}|methods", m, g, "wrist_above_floor"), 1) for g in G) + " |")
+            L.append(f"\n*Segment {sname}: interpolation ablation, wrist error over all dropped frames (cm)*\n\n" + hdr)
+            for m in ["A_oracle", "A_repeat", "A_lewm", "I_nearest", "I_linear", "I_lewm_endfix"]:
+                if R(f"seg:{sname}|gapall", m, 1, "wrist") is not None:
+                    L.append(f"| {m} | " + " | ".join(f(R(f"seg:{sname}|gapall", m, g, "wrist"), 1) for g in G) + " |")
     return res
 
 
@@ -166,7 +271,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root"); ap.add_argument("md")
     ap.add_argument("--split", default="val"); ap.add_argument("--B", type=int, default=1000)
+    ap.add_argument("--seg", default=None, help="segments npz (default <root>/segments_<split>.npz if present)")
     a = ap.parse_args()
+    sp = a.seg or f"{a.root}/segments_{a.split}.npz"
+    seg = np.load(sp) if os.path.exists(sp) else None
+    print("segments:", sp if seg is not None else "none", flush=True)
     L = [f"# Recording-level bootstrap, {a.split} ({a.B} resamples, 95% percentile CIs)\n"]
     first = True
     for m in MODELS:
@@ -180,7 +289,7 @@ def main():
         if first:
             L.append(f"{len(bt.names)} recordings, {len(S['rec'])} windows. Wide CIs come from few recordings.\n")
             first = False
-        gap_tables(m, S, bt, L, f"{a.root}/{m}/boot_{a.split}.json")
+        gap_tables(m, S, bt, L, f"{a.root}/{m}/boot_{a.split}.json", seg)
         if S2 is not None:
             rq2_tables(m, S2, bt, L, f"{a.root}/{m}/boot_rq2_{a.split}.json")
         print("done", m, flush=True)
